@@ -1,109 +1,140 @@
 import os
 import time
+import math
 import traceback
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
 from flask import Flask, jsonify, request
-from apscheduler.schedulers.background import BackgroundScheduler
-from pytz import timezone
-
-app = Flask(__name__)
 
 # =========================================================
-# ENV CONFIG
+# 基础配置
 # =========================================================
-PORT = int(os.getenv("PORT", "8080"))
-TZ_NAME = os.getenv("TIMEZONE", "Asia/Kuala_Lumpur")
+
+APP_NAME = "US Stock Scanner V7.2"
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Kuala_Lumpur")
+
 ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "true").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
 INTERNAL_SCAN_TOKEN = os.getenv("INTERNAL_SCAN_TOKEN", "").strip()
+
 ENABLE_INTERNAL_SCHEDULER = os.getenv("ENABLE_INTERNAL_SCHEDULER", "false").lower() == "true"
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
-TOP_N_MAIN = int(os.getenv("TOP_N_MAIN", "15"))
-TOP_N_EARLY = int(os.getenv("TOP_N_EARLY", "10"))
-
-# Scan params
-MIN_PRICE = float(os.getenv("MIN_PRICE", "2"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "100"))
-MIN_AVG_DOLLAR_VOLUME = float(os.getenv("MIN_AVG_DOLLAR_VOLUME", "3000000"))
-MAX_DAILY_GAIN_FILTER = float(os.getenv("MAX_DAILY_GAIN_FILTER", "8.0"))
-BREAKOUT_DISTANCE_PCT = float(os.getenv("BREAKOUT_DISTANCE_PCT", "5.0"))
-EARLY_SIGNAL_DISTANCE_PCT = float(os.getenv("EARLY_SIGNAL_DISTANCE_PCT", "8.0"))
-VOLUME_RATIO_MIN = float(os.getenv("VOLUME_RATIO_MIN", "1.8"))
-STRONG_VOLUME_RATIO = float(os.getenv("STRONG_VOLUME_RATIO", "2.5"))
-ACCUM_NEAR_BREAKOUT_PCT = float(os.getenv("ACCUM_NEAR_BREAKOUT_PCT", "5.0"))
-PREMARKET_TOP_CANDIDATES = int(os.getenv("PREMARKET_TOP_CANDIDATES", "25"))
-NEWS_TOP_CANDIDATES = int(os.getenv("NEWS_TOP_CANDIDATES", "40"))
 
 # =========================================================
-# 200-stock universe (curated high-volatility / liquid / thematic)
+# 稳定版扫描参数
 # =========================================================
+
+MIN_PRICE = 2
+MAX_PRICE = 80
+LOOKBACK_PERIOD = "6mo"
+
+MIN_AVG_DOLLAR_VOLUME = 4_000_000
+MAX_DAILY_GAIN_FILTER = 8.0
+
+BREAKOUT_DISTANCE_PCT = 5.0
+EARLY_SIGNAL_DISTANCE_PCT = 8.0
+ACCUM_NEAR_BREAKOUT_PCT = 5.0
+
+VOLUME_RATIO_MIN = 1.8
+STRONG_VOLUME_RATIO = 2.5
+
+TOP_N_MAIN = 10
+TOP_N_EARLY = 8
+
+# ====== V7.2 限速参数 ======
+PER_TICKER_SLEEP = 0.35      # 每支股票之间停顿
+BATCH_SIZE = 20              # 每批20支
+BATCH_SLEEP = 3.0            # 每批后休息3秒
+DOWNLOAD_RETRY = 3           # 下载重试次数
+DOWNLOAD_RETRY_SLEEP = 1.5   # 重试间隔
+NEWS_CHECK_LIMIT = 15        # 只对前15名候选股查新闻
+PREMARKET_CHECK_LIMIT = 15   # 只对前15名候选股查盘前
+REQUEST_TIMEOUT = 10
+
+# =========================================================
+# 200股股票池（稳健版）
+# =========================================================
+
 TICKERS = [
-    # Mega cap / AI / semis
-    "NVDA", "AMD", "AVGO", "ARM", "MU", "QCOM", "MRVL", "ANET", "VRT", "TSM",
-    "AMAT", "LRCX", "KLAC", "ASML", "SMCI", "INTC", "TXN", "ADI", "NXPI", "MCHP",
-    "ON", "CRDO", "ALAB", "MPWR", "ENTG",
+    # Mega / AI / Tech
+    "NVDA", "AMD", "SMCI", "PLTR", "TSLA", "META", "AMZN", "MSFT", "AAPL", "GOOGL",
+    "AVGO", "ARM", "MU", "QCOM", "CRM", "SNOW", "NET", "CRWD", "SHOP", "UBER",
+    "TTD", "DDOG", "ZS", "PANW", "NOW", "MDB", "ADBE", "ORCL", "INTC", "ANET",
 
-    # Software / cloud / cyber / data
-    "MSFT", "META", "AMZN", "GOOGL", "AAPL", "PLTR", "SNOW", "CRM", "NOW", "DDOG",
-    "NET", "CRWD", "PANW", "ZS", "OKTA", "MDB", "ESTC", "HUBS", "TEAM", "SHOP",
-    "TTD", "APP", "PATH", "AI", "BBAI",
+    # Fintech / Payment / Crypto
+    "COIN", "MSTR", "MARA", "RIOT", "HUT", "SOFI", "NU", "UPST", "AFRM", "HOOD",
+    "PYPL", "SQ", "RBLX", "GTLB", "DOCU", "BILL", "TOST", "CFLT", "PATH", "AI",
 
-    # Fintech / brokers / consumer tech
-    "AFRM", "UPST", "SOFI", "NU", "HOOD", "COIN", "MSTR", "PYPL", "SQ", "GTLB",
-    "DUOL", "CELH", "HIMS", "ROKU", "PINS", "RDDT", "DASH", "UBER", "ABNB", "CAVA",
+    # AI / Robotics / Emerging Tech
+    "BBAI", "SERV", "IONQ", "QBTS", "RGTI", "SOUN", "TEM", "APP", "RDDT", "C3AI",
+    "ESTC", "S", "FROG", "ASAN", "IOT", "CLS", "SPSC", "FSLY", "WK", "AIOT",
 
-    # EV / auto / clean tech / infra
-    "TSLA", "RIVN", "LCID", "NIO", "XPEV", "LI", "FSLR", "ENPH", "SEDG", "RUN",
-    "ARRY", "BE", "CHPT", "BLDP", "PWR", "ETN", "HUBB", "NVT", "AESI", "FLNC",
+    # Space / Defense / High Beta
+    "RKLB", "ASTS", "LUNR", "JOBY", "ACHR", "KTOS", "AVAV", "SPCE", "BLDE", "IRDM",
+    "MAXN", "ARQQ", "BKSY", "PL", "MDAI", "DXYZ", "SIDU", "MNTS", "SATL", "RDW",
 
-    # Space / defense / quantum / frontier tech
-    "RKLB", "LUNR", "ASTS", "PL", "IONQ", "QBTS", "RGTI", "QUBT", "SOUN", "SERV",
-    "KTOS", "AVAV", "ACHR", "JOBY", "EVTL", "SPIR", "BKSY", "SATS", "INTA", "S",
+    # Energy / Nuclear / Power / AI Infra
+    "VRT", "PWR", "ENPH", "SEDG", "FSLR", "RUN", "SMR", "OKLO", "NNE", "CEG",
+    "NRG", "VST", "GEV", "ETN", "HUBB", "FIX", "MYRG", "POWL", "AES", "BE",
 
-    # Nuclear / uranium / energy themes
-    "OKLO", "SMR", "NNE", "CCJ", "UUUU", "LEU", "CEG", "VST", "TLN", "NRG",
-    "BWXT", "GEV", "VRT", "PWR", "ETR", "PCG", "PEG", "AEP", "NEE", "XEL",
+    # Consumer / Growth / Momentum
+    "CAVA", "ELF", "ONON", "CELH", "DUOL", "HIMS", "OLLI", "BROS", "CMG", "NKE",
+    "LULU", "ULTA", "CROX", "ANF", "ABNB", "DASH", "CVNA", "CAR", "BKNG", "EXPE",
 
-    # Biotech / medtech momentum names
-    "TEM", "DXCM", "TMDX", "INSP", "ALNY", "VRTX", "ARGX", "MRNA", "NTRA", "EXAS",
-    "CRSP", "BEAM", "NTLA", "RXRX", "CGON", "VKTX", "HIMS", "OSCR", "ELV", "UNH",
+    # Biotech / Health High Beta
+    "VKTX", "ALT", "HIMS", "OSCR", "RXRX", "CRSP", "EDIT", "BEAM", "NTLA", "VERV",
+    "MDGL", "CYTK", "MRNA", "DNA", "SDGR", "XBI", "TGTX", "ALKS", "EXEL", "GH",
 
-    # Retail / consumer momentum
-    "ONON", "ELF", "ANF", "DECK", "BIRK", "WING", "CMG", "COST", "LULU", "ULTA",
-    "NKE", "ETSY", "RVLV", "BOOT", "SFM", "FIVE", "CVNA", "CAR", "BKNG", "EXPE",
+    # Semiconductor / Hardware / Infra
+    "AMAT", "KLAC", "LRCX", "ASML", "ONTO", "COHR", "MRVL", "MPWR", "ENTG", "WOLF",
+    "AEHR", "ACLS", "FORM", "HIMX", "SYNA", "ALAB", "CAMT", "IPGP", "OLED", "TER",
 
-    # Industrials / logistics / construction / materials
-    "GE", "CAT", "URI", "PH", "TT", "EMR", "JCI", "HWM", "AXON", "NXT",
-    "FIX", "STRL", "MTZ", "ROAD", "MLM", "VMC", "X", "CLF", "FCX", "TECK",
+    # Industrial / Transport / cyclicals
+    "DE", "CAT", "URI", "PCAR", "ODFL", "XPO", "SAIA", "UBER", "PINS", "ETSY",
+    "ROKU", "SNAP", "SPOT", "NFLX", "DIS", "PARA", "WBD", "DJT", "BABA", "PDD",
 
-    # China / internet ADR high beta
-    "BABA", "PDD", "JD", "BIDU", "TME", "IQ", "DADA", "KWEB", "YINN", "FUTU"
+    # Extra momentum / tradable
+    "FUBO", "PLUG", "CHPT", "QS", "LCID", "RIVN", "NIO", "XPEV", "LI", "GRAB",
+    "OPEN", "ARRY", "W", "GME", "AMC", "BB", "SIRI", "INTA", "ZI", "APPS"
 ]
 
-# dedupe while preserving order
+# 去重后保留顺序
 _seen = set()
 TICKERS = [x for x in TICKERS if not (x in _seen or _seen.add(x))]
 
-LAST_SCAN_SUMMARY = {
-    "status": "never_run",
+# =========================================================
+# 全局状态
+# =========================================================
+
+app = Flask(__name__)
+
+SCAN_LOCK = Lock()
+SCAN_STATE = {
+    "status": "running",
     "last_run": None,
+    "last_scan_summary": "never_run",
     "main_count": 0,
     "early_count": 0,
-    "top_tickers": []
+    "top_tickers": [],
+    "tickers": len(TICKERS),
+    "scheduler_enabled": ENABLE_INTERNAL_SCHEDULER,
+    "service": APP_NAME,
+    "timezone": TIMEZONE,
 }
 
-scheduler = None
+# =========================================================
+# 工具函数
+# =========================================================
 
-# =========================================================
-# Helpers
-# =========================================================
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 def safe_float(x, default=0.0):
     try:
         if pd.isna(x):
@@ -112,111 +143,214 @@ def safe_float(x, default=0.0):
     except Exception:
         return default
 
+def pct_change(a, b):
+    if b is None or b == 0:
+        return 0.0
+    return (a - b) / b * 100.0
 
 def format_pct(v):
     return f"{v:.2f}%"
 
-
 def format_price(v):
     return f"${v:.2f}"
-
 
 def calc_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
+
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
+
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
-
 def send_telegram_message(text: str):
-    if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not ENABLE_TELEGRAM:
         print(text)
-        return False
+        return
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram 未配置，改为本地输出")
+        print(text)
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        r = requests.post(url, json=payload, timeout=20)
-        print("telegram:", r.status_code)
-        return r.status_code == 200
+        requests.post(url, json=payload, timeout=20)
     except Exception as e:
-        print("Telegram error:", e)
-        return False
-
-
-def split_text(text, limit=3800):
-    if len(text) <= limit:
-        return [text]
-    parts = []
-    current = []
-    size = 0
-    for line in text.splitlines(True):
-        if size + len(line) > limit and current:
-            parts.append("".join(current))
-            current = [line]
-            size = len(line)
-        else:
-            current.append(line)
-            size += len(line)
-    if current:
-        parts.append("".join(current))
-    return parts
-
+        print("Telegram 发送失败:", e)
 
 # =========================================================
-# Data acquisition
+# 稳定版数据下载
 # =========================================================
-def download_daily_data(ticker):
+
+def normalize_ohlcv(df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+    cols = {}
+    for c in df.columns:
+        lc = str(c).lower()
+        if "open" == lc or lc.endswith("open"):
+            cols[c] = "Open"
+        elif "high" == lc or lc.endswith("high"):
+            cols[c] = "High"
+        elif "low" == lc or lc.endswith("low"):
+            cols[c] = "Low"
+        elif "close" == lc or lc.endswith("close"):
+            cols[c] = "Close"
+        elif "volume" == lc or lc.endswith("volume"):
+            cols[c] = "Volume"
+
+    df = df.rename(columns=cols)
+
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(c in df.columns for c in needed):
+        return None
+
+    df = df[needed].copy().dropna()
+    if len(df) < 40:
+        return None
+    return df
+
+def download_daily_data(ticker: str):
+    last_err = None
+
+    for attempt in range(DOWNLOAD_RETRY):
+        try:
+            df = yf.download(
+                ticker,
+                period=LOOKBACK_PERIOD,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False
+            )
+
+            df = normalize_ohlcv(df)
+            if df is not None and not df.empty:
+                return df
+
+        except Exception as e:
+            last_err = e
+
+        time.sleep(DOWNLOAD_RETRY_SLEEP * (attempt + 1))
+
+    if last_err:
+        print(f"[{ticker}] daily download failed: {last_err}")
+    return None
+
+def fetch_premarket_data(ticker: str):
+    """
+    只对高分候选股查，减少限流。
+    """
     try:
         df = yf.download(
             ticker,
-            period="8mo",
-            interval="1d",
+            period="2d",
+            interval="1m",
+            prepost=True,
             auto_adjust=False,
             progress=False,
-            threads=False,
-            prepost=False,
+            threads=False
         )
-        if df is None or df.empty:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-        df = df[[c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]].copy()
-        if len(df) < 60:
-            return None
-        df = df.dropna()
-        return df
-    except Exception:
-        return None
 
+        if df is None or df.empty:
+            return {
+                "pm_change": 0.0,
+                "pm_volume": 0.0,
+                "pm_active": False
+            }
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+        if "Close" not in df.columns or "Volume" not in df.columns:
+            return {"pm_change": 0.0, "pm_volume": 0.0, "pm_active": False}
+
+        last_close = safe_float(df["Close"].dropna().iloc[-1])
+        prev_close = safe_float(df["Close"].dropna().iloc[0])
+
+        pm_change = pct_change(last_close, prev_close)
+        pm_volume = safe_float(df["Volume"].sum())
+
+        return {
+            "pm_change": pm_change,
+            "pm_volume": pm_volume,
+            "pm_active": abs(pm_change) >= 1.0 or pm_volume > 100000
+        }
+    except Exception:
+        return {
+            "pm_change": 0.0,
+            "pm_volume": 0.0,
+            "pm_active": False
+        }
+
+def check_news_quick(ticker: str):
+    """
+    轻量新闻检查，只对候选股查。
+    """
+    try:
+        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={ticker}"
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            return {"has_news": False, "news_score": 0}
+
+        data = r.json()
+        news = data.get("news", [])
+        count = len(news)
+
+        if count >= 5:
+            return {"has_news": True, "news_score": 15}
+        elif count >= 2:
+            return {"has_news": True, "news_score": 10}
+        elif count >= 1:
+            return {"has_news": True, "news_score": 6}
+        else:
+            return {"has_news": False, "news_score": 0}
+    except Exception:
+        return {"has_news": False, "news_score": 0}
+
+# =========================================================
+# 指标计算
+# =========================================================
 
 def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
     df["MA5"] = df["Close"].rolling(5).mean()
     df["MA10"] = df["Close"].rolling(10).mean()
     df["MA20"] = df["Close"].rolling(20).mean()
     df["MA50"] = df["Close"].rolling(50).mean()
+
     df["VOL5"] = df["Volume"].rolling(5).mean()
+    df["VOL10"] = df["Volume"].rolling(10).mean()
     df["VOL20"] = df["Volume"].rolling(20).mean()
+
     tr = pd.concat([
-        df["High"] - df["Low"],
+        (df["High"] - df["Low"]),
         (df["High"] - df["Close"].shift(1)).abs(),
-        (df["Low"] - df["Close"].shift(1)).abs()
+        (df["Low"] - df["Close"].shift(1)).abs(),
     ], axis=1).max(axis=1)
-    df["ATR14"] = tr.rolling(14).mean()
+
+    df["ATR"] = tr.rolling(14).mean()
     df["RSI14"] = calc_rsi(df["Close"], 14)
     df["DailyPct"] = df["Close"].pct_change() * 100
     df["DollarVolume"] = df["Close"] * df["Volume"]
-    return df
 
+    return df
 
 def detect_accumulation(df: pd.DataFrame):
     if len(df) < 30:
@@ -224,9 +358,11 @@ def detect_accumulation(df: pd.DataFrame):
 
     recent = df.tail(10).copy()
     today = recent.iloc[-1]
+
     recent["RangePct"] = (recent["High"] - recent["Low"]) / recent["Close"] * 100
     avg_range_10 = safe_float(recent["RangePct"].mean())
     avg_range_5 = safe_float(recent["RangePct"].tail(5).mean())
+
     vol5 = safe_float(today["VOL5"])
     vol20 = safe_float(today["VOL20"])
     volume_ratio = today["Volume"] / vol20 if vol20 > 0 else 0
@@ -238,10 +374,11 @@ def detect_accumulation(df: pd.DataFrame):
 
     box_high = recent["High"].max()
     box_low = recent["Low"].min()
-    box_mid = (box_high + box_low) / 2 if (box_high + box_low) != 0 else today["Close"]
+    box_mid = (box_high + box_low) / 2
     close = today["Close"]
 
     score = 0
+
     if avg_range_5 <= avg_range_10:
         score += 20
     if avg_range_5 < 4.5:
@@ -250,139 +387,16 @@ def detect_accumulation(df: pd.DataFrame):
         score += 15
     if 0.95 <= close / box_mid <= 1.05:
         score += 15
-    if volume_ratio >= 1.3:
+    if volume_ratio >= 1.2:
         score += 15
     if upper_wick_ratio < 0.35:
         score += 15
 
     if score >= 80:
         return True, "A", score
-    if score >= 60:
+    elif score >= 60:
         return True, "B", score
     return False, "C", score
-
-
-def smart_money_score(close, high, low, volume_ratio):
-    rng = max(high - low, 0.0001)
-    close_location = (close - low) / rng
-    score = 0
-    if close_location >= 0.8:
-        score += 10
-    elif close_location >= 0.65:
-        score += 6
-    else:
-        score += 2
-
-    if volume_ratio >= 3.0:
-        score += 10
-    elif volume_ratio >= 2.0:
-        score += 7
-    elif volume_ratio >= 1.5:
-        score += 4
-    else:
-        score += 1
-
-    return score, close_location
-
-
-def get_news_score(ticker):
-    """Try yfinance news. If unavailable, return neutral score 0."""
-    try:
-        tk = yf.Ticker(ticker)
-        news_items = []
-        if hasattr(tk, "news"):
-            news_items = tk.news or []
-        count = len(news_items)
-        if count >= 5:
-            return 15, count
-        if count >= 2:
-            return 10, count
-        if count >= 1:
-            return 6, count
-        return 0, 0
-    except Exception:
-        return 0, 0
-
-
-def get_premarket_signal(ticker):
-    """Use 1m pre/post data. Return (score, pct, volume, note)."""
-    try:
-        df = yf.download(
-            ticker,
-            period="5d",
-            interval="1m",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-            prepost=True,
-        )
-        if df is None or df.empty:
-            return 0, 0.0, 0, "无盘前数据"
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-        if "Close" not in df.columns or "Volume" not in df.columns:
-            return 0, 0.0, 0, "无有效盘前数据"
-
-        idx = df.index
-        if getattr(idx, "tz", None) is not None:
-            idx_local = idx.tz_convert("America/New_York")
-        else:
-            idx_local = idx.tz_localize("America/New_York")
-        df = df.copy()
-        df.index = idx_local
-
-        today_date = idx_local[-1].date()
-        today_df = df[df.index.date == today_date]
-        if today_df.empty:
-            return 0, 0.0, 0, "今日无数据"
-
-        pre = today_df.between_time("04:00", "09:29")
-        regular = today_df.between_time("09:30", "16:00")
-        if pre.empty:
-            return 0, 0.0, 0, "暂无盘前成交"
-
-        pre_last = safe_float(pre["Close"].iloc[-1])
-        pre_vol = int(safe_float(pre["Volume"].sum(), 0))
-
-        ref_close = None
-        if not regular.empty:
-            ref_close = safe_float(regular["Close"].iloc[0])
-        else:
-            # fallback to previous non-today close before today starts
-            prev_df = df[df.index.date < today_date]
-            if not prev_df.empty:
-                prev_regular = prev_df.between_time("09:30", "16:00")
-                if not prev_regular.empty:
-                    ref_close = safe_float(prev_regular["Close"].iloc[-1])
-                else:
-                    ref_close = safe_float(prev_df["Close"].iloc[-1])
-
-        if not ref_close or ref_close <= 0:
-            return 0, 0.0, pre_vol, "盘前基准价不足"
-
-        pre_pct = (pre_last - ref_close) / ref_close * 100
-        score = 0
-        if pre_pct >= 3.0:
-            score += 15
-        elif pre_pct >= 1.5:
-            score += 10
-        elif pre_pct > 0:
-            score += 4
-        elif pre_pct <= -2.0:
-            score -= 5
-
-        if pre_vol >= 500000:
-            score += 8
-        elif pre_vol >= 100000:
-            score += 5
-        elif pre_vol >= 30000:
-            score += 2
-
-        note = f"盘前{pre_pct:.2f}% / 量{pre_vol:,}"
-        return score, pre_pct, pre_vol, note
-    except Exception:
-        return 0, 0.0, 0, "盘前抓取失败"
-
 
 def analyze_ticker(ticker: str):
     df = download_daily_data(ticker)
@@ -402,6 +416,7 @@ def analyze_ticker(ticker: str):
 
     if close < MIN_PRICE or close > MAX_PRICE:
         return None
+
     if avg_dollar_vol < MIN_AVG_DOLLAR_VOLUME:
         return None
 
@@ -412,13 +427,15 @@ def analyze_ticker(ticker: str):
 
     distance_to_breakout = (resistance_20 - close) / resistance_20 * 100
     daily_gain = safe_float(today["DailyPct"])
+
     vol_ratio_20 = volume / vol20 if vol20 > 0 else 0
+    vol_ratio_5 = volume / vol5 if vol5 > 0 else 0
 
     ma5 = safe_float(today["MA5"])
     ma10 = safe_float(today["MA10"])
     ma20 = safe_float(today["MA20"])
     ma50 = safe_float(today["MA50"])
-    atr = safe_float(today["ATR14"])
+    atr = safe_float(today["ATR"])
     rsi = safe_float(today["RSI14"])
 
     if close > ma10 > ma20 > 0:
@@ -436,16 +453,17 @@ def analyze_ticker(ticker: str):
 
     is_breakout = close > resistance_20 and vol_ratio_20 >= VOLUME_RATIO_MIN
     is_near_breakout = 0 <= distance_to_breakout <= BREAKOUT_DISTANCE_PCT
+
     early_signal = (
         0 <= distance_to_breakout <= EARLY_SIGNAL_DISTANCE_PCT
         and close > ma5 > ma20 > 0
         and daily_gain < 4.5
     )
 
-    accum_flag, accum_grade, accum_score_raw = detect_accumulation(df)
-    sm_score, close_location = smart_money_score(close, high, low, vol_ratio_20)
+    accum_flag, accum_grade, accum_score = detect_accumulation(df)
 
-    # score components
+    # ===== 基础评分 =====
+    volume_score = 5
     if vol_ratio_20 >= 3.0:
         volume_score = 30
     elif vol_ratio_20 >= 2.5:
@@ -456,9 +474,8 @@ def analyze_ticker(ticker: str):
         volume_score = 18
     elif vol_ratio_20 >= 1.5:
         volume_score = 12
-    else:
-        volume_score = 5
 
+    breakout_score = 3
     if is_breakout:
         breakout_score = 30
     elif distance_to_breakout <= 2:
@@ -469,9 +486,8 @@ def analyze_ticker(ticker: str):
         breakout_score = 18
     elif distance_to_breakout <= 8:
         breakout_score = 10
-    else:
-        breakout_score = 3
 
+    trend_score = 2
     if close > ma5 > ma10 > ma20 > ma50 > 0:
         trend_score = 20
     elif close > ma5 > ma10 > ma20 > 0:
@@ -480,34 +496,45 @@ def analyze_ticker(ticker: str):
         trend_score = 13
     elif close > ma20 > 0:
         trend_score = 8
-    else:
-        trend_score = 2
 
+    candle_score = 1
     if upper_wick_ratio < 0.2:
         candle_score = 10
     elif upper_wick_ratio < 0.35:
         candle_score = 7
     elif upper_wick_ratio < 0.5:
         candle_score = 4
-    else:
-        candle_score = 1
 
+    rsi_score = 4
     if 55 <= rsi <= 68:
         rsi_score = 10
     elif 50 <= rsi < 55 or 68 < rsi <= 75:
         rsi_score = 7
-    else:
-        rsi_score = 4
 
+    accum_bonus = 4
     if accum_grade == "A":
         accum_bonus = 18
     elif accum_grade == "B":
         accum_bonus = 12
-    else:
-        accum_bonus = 4
+
+    # 主力资金流简化判断
+    money_flow_ratio = (close - low) / (high - low + 0.001)
+    smart_money = money_flow_ratio > 0.7 and vol_ratio_20 >= 1.8
+    smart_money_score = 12 if smart_money else 0
+
+    total_score = (
+        volume_score
+        + breakout_score
+        + trend_score
+        + candle_score
+        + rsi_score
+        + accum_bonus
+        + smart_money_score
+    )
 
     penalty = 0
     risk_flags = []
+
     if daily_gain > MAX_DAILY_GAIN_FILTER:
         penalty += 12
         risk_flags.append("当天涨幅过大")
@@ -516,30 +543,45 @@ def analyze_ticker(ticker: str):
         risk_flags.append("长上影偏重")
     if close < ma20:
         penalty += 8
-        risk_flags.append("仍在MA20下方")
+        risk_flags.append("MA20下方")
     if vol_ratio_20 < 1.2:
         penalty += 10
         risk_flags.append("量能不足")
 
-    base_score = max(volume_score + breakout_score + trend_score + candle_score + rsi_score + accum_bonus + sm_score - penalty, 0)
+    final_score = max(total_score - penalty, 0)
 
-    if base_score >= 88:
+    if final_score >= 88:
         signal_grade = "S"
-    elif base_score >= 78:
+    elif final_score >= 78:
         signal_grade = "A"
-    elif base_score >= 68:
+    elif final_score >= 68:
         signal_grade = "B"
-    elif base_score >= 58:
+    elif final_score >= 58:
         signal_grade = "C"
     else:
         signal_grade = "D"
 
-    breakout_price = resistance_20
-    buy_trigger = max(breakout_price * 1.002, close * 1.003)
-    chase_limit = breakout_price * 1.03
+    buy_trigger = max(resistance_20 * 1.002, close * 1.003)
+    chase_limit = resistance_20 * 1.03
     stop_loss = max(ma10, close - 1.2 * atr) if atr > 0 else ma10
     take_profit_1 = close * 1.03
     take_profit_2 = close * 1.05
+
+    potential_5pct = (
+        final_score >= 78
+        and vol_ratio_20 >= 1.8
+        and distance_to_breakout <= 5
+        and daily_gain < 6
+        and close > ma5 > ma20 > 0
+    )
+
+    action = "先观察，不急追"
+    if is_breakout and vol_ratio_20 >= STRONG_VOLUME_RATIO and daily_gain <= 6:
+        action = "可列为重点观察，盘中放量站稳可考虑跟进"
+    elif is_near_breakout and vol_ratio_20 >= VOLUME_RATIO_MIN:
+        action = "接近突破区，明天观察是否放量过前高"
+    elif accum_flag and distance_to_breakout <= ACCUM_NEAR_BREAKOUT_PCT:
+        action = "主力吸筹中，未突破，可列提前预警"
 
     return {
         "ticker": ticker,
@@ -556,112 +598,88 @@ def analyze_ticker(ticker: str):
         "trend_label": trend_label,
         "accum_flag": accum_flag,
         "accum_grade": accum_grade,
-        "accum_score": accum_score_raw,
-        "smart_money_score": sm_score,
-        "close_location": close_location,
+        "accum_score": accum_score,
         "is_breakout": is_breakout,
         "is_near_breakout": is_near_breakout,
         "early_signal": early_signal,
         "signal_grade": signal_grade,
-        "base_score": base_score,
-        "score": base_score,
-        "potential_5pct": False,
-        "action": "先观察",
+        "score": final_score,
+        "potential_5pct": potential_5pct,
+        "action": action,
         "buy_trigger": buy_trigger,
         "chase_limit": chase_limit,
         "stop_loss": stop_loss,
         "take_profit_1": take_profit_1,
         "take_profit_2": take_profit_2,
         "risk_flags": risk_flags,
+        "smart_money": smart_money,
         "news_score": 0,
-        "news_count": 0,
-        "premarket_score": 0,
-        "premarket_pct": 0.0,
-        "premarket_volume": 0,
-        "premarket_note": "未执行盘前确认",
+        "has_news": False,
+        "pm_change": 0.0,
+        "pm_volume": 0.0,
+        "pm_active": False,
     }
 
+# =========================================================
+# 候选股增强检查：只查高分股，减少限流
+# =========================================================
 
-def enrich_candidates_with_news(results):
-    ranked = sorted(results, key=lambda x: x["score"], reverse=True)[:NEWS_TOP_CANDIDATES]
-    selected = {r["ticker"]: r for r in ranked}
-    for ticker, row in selected.items():
-        score, count = get_news_score(ticker)
-        row["news_score"] = score
-        row["news_count"] = count
-        row["score"] += score
-    return results
+def enrich_candidates_with_news_and_premarket(results):
+    if not results:
+        return results
 
+    ranked = sorted(results, key=lambda x: x["score"], reverse=True)
 
-def enrich_candidates_with_premarket(results):
-    ranked = sorted(results, key=lambda x: x["score"], reverse=True)[:PREMARKET_TOP_CANDIDATES]
-    selected = {r["ticker"]: r for r in ranked}
-    for ticker, row in selected.items():
-        score, pct, vol, note = get_premarket_signal(ticker)
-        row["premarket_score"] = score
-        row["premarket_pct"] = pct
-        row["premarket_volume"] = vol
-        row["premarket_note"] = note
-        row["score"] += score
-    return results
+    for i, row in enumerate(ranked):
+        if i < NEWS_CHECK_LIMIT:
+            news = check_news_quick(row["ticker"])
+            row["has_news"] = news["has_news"]
+            row["news_score"] = news["news_score"]
+            row["score"] += news["news_score"]
 
+            time.sleep(0.4)
 
-def finalize_actions(results):
-    for r in results:
+        if i < PREMARKET_CHECK_LIMIT:
+            pm = fetch_premarket_data(row["ticker"])
+            row["pm_change"] = pm["pm_change"]
+            row["pm_volume"] = pm["pm_volume"]
+            row["pm_active"] = pm["pm_active"]
+
+            if row["pm_change"] >= 1.5:
+                row["score"] += 12
+            elif row["pm_change"] >= 0.8:
+                row["score"] += 7
+
+            time.sleep(0.4)
+
         if (
-            r["score"] >= 85
-            and r["volume_ratio"] >= 2
-            and r["distance_to_breakout"] <= 4
-            and r["news_score"] >= 6
-            and r["smart_money_score"] >= 12
+            row["score"] >= 85
+            and row["volume_ratio"] >= 1.8
+            and row["distance_to_breakout"] <= 4
+            and row["has_news"]
+            and (row["smart_money"] or row["pm_change"] >= 1.2)
         ):
-            r["potential_5pct"] = True
+            row["potential_5pct"] = True
 
-        if r["is_breakout"] and r["volume_ratio"] >= STRONG_VOLUME_RATIO and r["daily_gain"] <= 6:
-            r["action"] = "可列为明日重点，盘中放量站稳可顺势跟进"
-        elif r["is_near_breakout"] and r["volume_ratio"] >= VOLUME_RATIO_MIN:
-            r["action"] = "接近突破区，优先观察是否放量过前高"
-        elif r["accum_flag"] and r["distance_to_breakout"] <= ACCUM_NEAR_BREAKOUT_PCT:
-            r["action"] = "主力吸筹中，未正式突破，可列入提前预警"
-        else:
-            r["action"] = "先观察，不急着追"
+    return sorted(ranked, key=lambda x: (x["potential_5pct"], x["score"]), reverse=True)
 
-        if r["score"] >= 95:
-            r["signal_grade"] = "S"
-        elif r["score"] >= 85:
-            r["signal_grade"] = "A"
-        elif r["score"] >= 72:
-            r["signal_grade"] = "B"
-        elif r["score"] >= 60:
-            r["signal_grade"] = "C"
-        else:
-            r["signal_grade"] = "D"
-    return results
-
-
-def analyze_universe():
-    results = []
-    errors = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(analyze_ticker, t): t for t in TICKERS}
-        for future in as_completed(futures):
-            ticker = futures[future]
-            try:
-                res = future.result()
-                if res:
-                    results.append(res)
-            except Exception as e:
-                errors.append((ticker, str(e)))
-    return results, errors
-
+# =========================================================
+# 消息生成
+# =========================================================
 
 def build_message(results):
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not results:
+        return (
+            f"📭 <b>{APP_NAME}</b>\n"
+            f"时间：{now_str()}\n\n"
+            f"今天没有符合条件的股票。"
+        )
+
     main_list = []
     early_list = []
 
     for r in results:
-        if r["score"] >= 72 and r["daily_gain"] < MAX_DAILY_GAIN_FILTER:
+        if r["score"] >= 68 and r["daily_gain"] < MAX_DAILY_GAIN_FILTER:
             if r["is_breakout"] or r["is_near_breakout"] or r["potential_5pct"]:
                 main_list.append(r)
 
@@ -670,28 +688,32 @@ def build_message(results):
             r["accum_grade"] in ["A", "B"]
             and not r["is_breakout"]
             and r["distance_to_breakout"] <= EARLY_SIGNAL_DISTANCE_PCT
-            and r["score"] >= 60
+            and r["score"] >= 58
         ):
             early_list.append(r)
 
-    main_list = sorted(main_list, key=lambda x: (
-        x["potential_5pct"],
-        x["signal_grade"] == "S",
-        x["score"],
-        x["volume_ratio"],
-        x["premarket_pct"],
-    ), reverse=True)[:TOP_N_MAIN]
+    main_list = sorted(
+        main_list,
+        key=lambda x: (
+            x["potential_5pct"],
+            x["score"],
+            x["volume_ratio"]
+        ),
+        reverse=True
+    )[:TOP_N_MAIN]
 
-    early_list = sorted(early_list, key=lambda x: (
-        x["accum_grade"] == "A",
-        x["score"],
-        -x["distance_to_breakout"],
-    ), reverse=True)[:TOP_N_EARLY]
+    early_list = sorted(
+        early_list,
+        key=lambda x: (
+            x["accum_grade"] == "A",
+            x["score"]
+        ),
+        reverse=True
+    )[:TOP_N_EARLY]
 
     lines = []
-    lines.append(f"🚀 <b>美股爆发扫描器 V7</b>")
-    lines.append(f"🕒 时间：{now_str}")
-    lines.append(f"📦 扫描池：{len(TICKERS)} 支")
+    lines.append(f"🚀 <b>{APP_NAME}</b>")
+    lines.append(f"🕒 时间：{now_str()}")
     lines.append("")
 
     if main_list:
@@ -700,18 +722,17 @@ def build_message(results):
             tag = "🎯5%潜力" if r["potential_5pct"] else "观察"
             breakout_text = "已突破" if r["is_breakout"] else "近突破"
             risk_text = "；".join(r["risk_flags"]) if r["risk_flags"] else "无明显异常"
-            news_text = f"新闻{r['news_count']}条/+{r['news_score']}"
-            pre_text = f"{r['premarket_note']}/+{r['premarket_score']}"
+
             lines.append(
                 f"{i}. <b>{r['ticker']}</b> | 等级 {r['signal_grade']} | 分数 {r['score']:.1f} | {tag}\n"
                 f"   收盘：{format_price(r['close'])} ({format_pct(r['daily_gain'])})\n"
                 f"   量比：{r['volume_ratio']:.2f}x | {breakout_text} | 距离突破：{format_pct(r['distance_to_breakout'])}\n"
-                f"   趋势：{r['trend_label']} | 吸筹：{r['accum_grade']}({r['accum_score']}) | 资金：+{r['smart_money_score']}\n"
-                f"   催化：{news_text} | 盘前：{pre_text}\n"
-                f"   明天买点：>{format_price(r['buy_trigger'])}\n"
-                f"   不追价区：>{format_price(r['chase_limit'])}\n"
-                f"   止损参考：{format_price(r['stop_loss'])}\n"
-                f"   止盈参考：{format_price(r['take_profit_1'])} / {format_price(r['take_profit_2'])}\n"
+                f"   新闻：{'有' if r['has_news'] else '无'} | 盘前：{format_pct(r['pm_change'])}\n"
+                f"   趋势：{r['trend_label']} | 吸筹：{r['accum_grade']} | 主力资金：{'是' if r['smart_money'] else '否'}\n"
+                f"   买点：>{format_price(r['buy_trigger'])}\n"
+                f"   不追价：>{format_price(r['chase_limit'])}\n"
+                f"   止损：{format_price(r['stop_loss'])}\n"
+                f"   止盈：{format_price(r['take_profit_1'])} / {format_price(r['take_profit_2'])}\n"
                 f"   策略：{r['action']}\n"
                 f"   风险：{risk_text}"
             )
@@ -723,122 +744,117 @@ def build_message(results):
             lines.append(
                 f"{i}. <b>{r['ticker']}</b> | 吸筹 {r['accum_grade']} | 分数 {r['score']:.1f}\n"
                 f"   收盘：{format_price(r['close'])} | 距离突破：{format_pct(r['distance_to_breakout'])}\n"
-                f"   量比：{r['volume_ratio']:.2f}x | 趋势：{r['trend_label']} | 催化：{r['news_count']}条\n"
+                f"   量比：{r['volume_ratio']:.2f}x | 趋势：{r['trend_label']}\n"
                 f"   策略：先列观察名单，等放量突破再出手"
             )
             lines.append("")
 
     if not main_list and not early_list:
-        lines.append("📭 今天没有强信号。")
-        lines.append("建议：继续观察，避免硬追。")
-
-    lines.append("📌 <b>纪律</b>")
-    lines.append("1. 开盘直接高开太多不追")
-    lines.append("2. 只做放量突破，不做无量冲高")
-    lines.append("3. 主名单优先，提前预警次之")
-    lines.append("4. 跌回关键位就执行纪律")
+        lines.append("📭 今天没有强信号，继续观察。")
 
     return "\n".join(lines), main_list, early_list
 
+# =========================================================
+# 扫描主逻辑：V7.2 稳定版
+# =========================================================
 
 def run_scan(send_telegram=True):
-    global LAST_SCAN_SUMMARY
-    start = time.time()
-    results, errors = analyze_universe()
-    results = enrich_candidates_with_news(results)
-    results = enrich_candidates_with_premarket(results)
-    results = finalize_actions(results)
-    results = sorted(results, key=lambda x: (
-        x["potential_5pct"],
-        x["signal_grade"] == "S",
-        x["score"],
-        x["volume_ratio"],
-        x["premarket_pct"],
-    ), reverse=True)
+    with SCAN_LOCK:
+        start = time.time()
+        results = []
+        scanned_count = 0
 
-    msg, main_list, early_list = build_message(results)
+        print(f"[{now_str()}] 开始扫描 {len(TICKERS)} 支股票...")
 
-    if send_telegram:
-        for chunk in split_text(msg):
-            send_telegram_message(chunk)
+        for batch_start in range(0, len(TICKERS), BATCH_SIZE):
+            batch = TICKERS[batch_start: batch_start + BATCH_SIZE]
+            print(f"扫描批次: {batch_start + 1} - {batch_start + len(batch)}")
 
-    LAST_SCAN_SUMMARY = {
-        "status": "ok",
-        "last_run": datetime.now().isoformat(timespec="seconds"),
-        "elapsed_seconds": round(time.time() - start, 2),
-        "main_count": len(main_list),
-        "early_count": len(early_list),
-        "top_tickers": [x["ticker"] for x in main_list[:5]],
-        "errors": errors[:10],
-    }
+            for ticker in batch:
+                try:
+                    row = analyze_ticker(ticker)
+                    scanned_count += 1
+                    if row:
+                        results.append(row)
+                except Exception as e:
+                    print(f"[{ticker}] analyze error: {e}")
 
-    return {
-        "message": msg,
-        "results": results,
-        "main_list": main_list,
-        "early_list": early_list,
-        "errors": errors,
-        "summary": LAST_SCAN_SUMMARY,
-    }
+                time.sleep(PER_TICKER_SLEEP)
 
+            if batch_start + BATCH_SIZE < len(TICKERS):
+                print(f"批次完成，休息 {BATCH_SLEEP} 秒")
+                time.sleep(BATCH_SLEEP)
 
-# =========================================================
-# Scheduler
-# =========================================================
-def scheduled_scan(label):
-    try:
-        print(f"Running scheduled scan: {label}")
-        run_scan(send_telegram=True)
-    except Exception as e:
-        err = f"❌ 定时扫描异常\n{label}\n{str(e)}\n\n{traceback.format_exc()[:2500]}"
-        print(err)
-        send_telegram_message(err)
+        # 先按基础分排序，再对候选股增强检查
+        results = sorted(results, key=lambda x: x["score"], reverse=True)
+        results = enrich_candidates_with_news_and_premarket(results)
 
+        message, main_list, early_list = build_message(results)
 
-def setup_scheduler():
-    global scheduler
-    if not ENABLE_INTERNAL_SCHEDULER:
-        return None
-    scheduler = BackgroundScheduler(timezone=timezone(TZ_NAME))
-    # Malaysia time examples: 22:00 and 04:00 daily
-    scheduler.add_job(lambda: scheduled_scan("22:00 daily"), "cron", hour=22, minute=0)
-    scheduler.add_job(lambda: scheduled_scan("04:00 daily"), "cron", hour=4, minute=0)
-    scheduler.start()
-    return scheduler
+        duration = round(time.time() - start, 2)
 
+        SCAN_STATE["last_run"] = now_str()
+        SCAN_STATE["last_scan_summary"] = f"done_in_{duration}s"
+        SCAN_STATE["main_count"] = len(main_list)
+        SCAN_STATE["early_count"] = len(early_list)
+        SCAN_STATE["top_tickers"] = [x["ticker"] for x in main_list[:5]]
+
+        if send_telegram:
+            send_telegram_message(message)
+
+        return {
+            "ok": True,
+            "message": message,
+            "summary": {
+                "duration_sec": duration,
+                "scanned": scanned_count,
+                "results": len(results),
+                "main_count": len(main_list),
+                "early_count": len(early_list),
+            },
+            "main_list": main_list,
+            "early_list": early_list,
+        }
 
 # =========================================================
-# Routes
+# Flask 路由
 # =========================================================
-@app.route("/")
-def index():
+
+@app.route("/", methods=["GET"])
+def root():
     return jsonify({
-        "service": "US Stock Scanner V7",
+        "service": APP_NAME,
         "status": "running",
-        "tickers": len(TICKERS),
-        "timezone": TZ_NAME,
+        "timezone": TIMEZONE,
         "scheduler_enabled": ENABLE_INTERNAL_SCHEDULER,
-        "last_scan": LAST_SCAN_SUMMARY,
+        "tickers": len(TICKERS),
+        "last_run": SCAN_STATE["last_run"],
+        "last_scan": SCAN_STATE["last_scan_summary"],
+        "main_count": SCAN_STATE["main_count"],
+        "early_count": SCAN_STATE["early_count"],
+        "top_tickers": SCAN_STATE["top_tickers"],
     })
 
-
-@app.route("/api/health")
+@app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({
         "ok": True,
-        "service": "US Stock Scanner V7",
-        "tickers": len(TICKERS),
-        "last_scan": LAST_SCAN_SUMMARY,
+        "service": APP_NAME,
+        "time": now_str(),
+        "tickers": len(TICKERS)
     })
 
-
-@app.route("/run-scan", methods=["GET", "POST"])
+@app.route("/run-scan", methods=["GET"])
 def route_run_scan():
-    try:
-        token = request.args.get("token", "") or request.headers.get("X-Scan-Token", "")
-        if INTERNAL_SCAN_TOKEN and token != INTERNAL_SCAN_TOKEN:
-            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    token = request.args.get("token", "").strip()
 
+    if not INTERNAL_SCAN_TOKEN:
+        return jsonify({"ok": False, "error": "INTERNAL_SCAN_TOKEN not set"}), 500
+
+    if token != INTERNAL_SCAN_TOKEN:
+        return jsonify({"ok": False, "error": "invalid token"}), 403
+
+    try:
         data = run_scan(send_telegram=True)
         return jsonify({
             "ok": True,
@@ -864,8 +880,11 @@ def route_run_scan():
     except Exception as e:
         err = traceback.format_exc()
         send_telegram_message(f"❌ /run-scan 异常\n{str(e)}")
-        return jsonify({"ok": False, "error": str(e), "trace": err[:3000]}), 500
-
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "trace": err[:3000]
+        }), 500
 
 @app.route("/run-scan-local", methods=["GET"])
 def route_run_scan_local():
@@ -875,6 +894,19 @@ def route_run_scan_local():
     except Exception as e:
         return f"<pre>ERROR\n{str(e)}\n\n{traceback.format_exc()}</pre>", 500
 
+# =========================================================
+# scheduler 占位
+# =========================================================
+
+def setup_scheduler():
+    if ENABLE_INTERNAL_SCHEDULER:
+        print("内部定时扫描已开启，但当前版本建议仍以 Railway Cron / 外部调用为主。")
+    else:
+        print("内部定时扫描关闭。")
+
+# =========================================================
+# main
+# =========================================================
 
 if __name__ == "__main__":
     setup_scheduler()
