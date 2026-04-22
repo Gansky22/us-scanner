@@ -1,6 +1,14 @@
 # ============================================================
-# 美股爆发扫描器 V11 PRO - 500股专用优化版
+# 美股爆发扫描器 V11.2 + V11.5 智能买点版
 # Railway 付费版 / Flask / Telegram
+#
+# 功能：
+# 1) 盘前扫描：Top 5 + 预备股 5
+# 2) 盘中突破提醒
+# 3) 收盘明日预备股
+# 4) 500股扩容池
+# 5) V11.2 过滤过热股 / 假突破 / 涨太多
+# 6) V11.5 智能买点：可追突破 / 等回踩买 / 不要追
 # ============================================================
 
 import os
@@ -27,13 +35,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PORT = int(os.getenv("PORT", "5000"))
 
-# 500股建议 16~24
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
-
-# 每批下载数量，避免一次塞太多请求
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
-
-# 批次间暂停秒数
 BATCH_SLEEP = float(os.getenv("BATCH_SLEEP", "1.2"))
 
 TELEGRAM_MAX_LEN = 3500
@@ -50,7 +53,6 @@ INTRADAY_BREAKOUT_SENT = set()
 
 # ============================================================
 # 500股扩容版股票池
-# 直接用你上一条我给你的版本
 # ============================================================
 SECTOR_POOLS = {
     "AI_软件": [
@@ -216,14 +218,14 @@ def reset_daily_intraday_flags():
     if os.path.exists(marker):
         try:
             old = open(marker, "r", encoding="utf-8").read().strip()
-        except:
+        except Exception:
             old = ""
     if old != today:
         INTRADAY_BREAKOUT_SENT.clear()
         try:
             with open(marker, "w", encoding="utf-8") as f:
                 f.write(today)
-        except:
+        except Exception:
             pass
         save_state()
 
@@ -257,7 +259,7 @@ def send_telegram(msg):
                 if r.status_code == 200:
                     ok = True
                     break
-            except:
+            except Exception:
                 pass
             time.sleep(2)
         if not ok:
@@ -281,7 +283,7 @@ def safe_download(symbol, period="6mo", interval="1d"):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
         return df.dropna()
-    except:
+    except Exception:
         return None
 
 # ============================================================
@@ -295,11 +297,75 @@ def calc_rsi(series, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
+def calc_atr(df, period=14):
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
+
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    return atr
+
 def find_sector(symbol):
     for sector, arr in SECTOR_POOLS.items():
         if symbol in arr:
             return sector
     return "其他"
+
+def build_smart_entry_plan(last, high10, high20, ma20, atr, rsi14, change5, vol_ratio):
+    breakout_dist_pct = ((last - high10) / high10) * 100 if high10 > 0 else 0
+    extension_pct = ((last - ma20) / ma20) * 100 if ma20 > 0 else 0
+
+    plan = "接近买点"
+    note = "可小仓观察"
+    entry_low = round(last * 0.995, 2)
+    entry_high = round(last * 1.005, 2)
+
+    if rsi14 >= 85 or change5 >= 18 or extension_pct >= 15:
+        plan = "不要追"
+        note = "股价过热，等回踩MA20或前高再看"
+        entry_low = round(max(high10, ma20), 2)
+        entry_high = round(max(high10, ma20) * 1.01, 2)
+
+    elif 0 <= breakout_dist_pct <= 2.0 and vol_ratio >= 1.5 and rsi14 < 80:
+        plan = "可追突破"
+        note = "突破不远，量能配合，可等确认后进"
+        entry_low = round(high10, 2)
+        entry_high = round(last * 1.01, 2)
+
+    elif extension_pct >= 6:
+        plan = "等回踩买"
+        note = "离均线有点远，等回踩更安全"
+        entry_low = round(max(ma20, high10 * 0.995), 2)
+        entry_high = round(max(ma20, high10 * 1.005), 2)
+
+    else:
+        plan = "接近买点"
+        note = "位置还可以，但仍建议等确认"
+        entry_low = round(last * 0.995, 2)
+        entry_high = round(last * 1.01, 2)
+
+    atr_val = atr if atr and not math.isnan(atr) else last * 0.03
+    sl = round(max(0.01, min(entry_low - atr_val * 1.2, last * 0.97)), 2)
+    tp1 = round(last + atr_val * 2.0, 2)
+    tp2 = round(last + atr_val * 3.5, 2)
+
+    return {
+        "plan": plan,
+        "note": note,
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "breakout_dist_pct": round(breakout_dist_pct, 2),
+        "extension_pct": round(extension_pct, 2),
+    }
 
 def score_stock_daily(symbol, df):
     if df is None or len(df) < 70:
@@ -325,16 +391,20 @@ def score_stock_daily(symbol, df):
     low5 = float(low.iloc[-5:].min())
 
     rsi14 = float(calc_rsi(close, 14).iloc[-1])
+    atr14_series = calc_atr(df, 14)
+    atr14 = float(atr14_series.iloc[-1]) if not atr14_series.empty else last * 0.03
 
     vol_ratio = float(vol.iloc[-1] / avg_vol20) if avg_vol20 > 0 else 0
     change1 = ((last - prev) / prev) * 100 if prev > 0 else 0
     change5 = ((last - float(close.iloc[-6])) / float(close.iloc[-6])) * 100 if len(close) >= 6 else 0
     change20 = ((last - float(close.iloc[-21])) / float(close.iloc[-21])) * 100 if len(close) >= 21 else 0
+    extension = ((last - ma20) / ma20) * 100 if ma20 > 0 else 0
+    breakout_dist = ((last - high10) / high10) * 100 if high10 > 0 else 0
 
     score = 0
     reasons = []
+    warnings = []
 
-    # 趋势
     if last > ma20:
         score += 10
         reasons.append("站上MA20")
@@ -345,7 +415,6 @@ def score_stock_daily(symbol, df):
         score += 6
         reasons.append("MA50>MA200")
 
-    # 突破
     if last >= high10:
         score += 18
         reasons.append("突破10日高")
@@ -353,7 +422,6 @@ def score_stock_daily(symbol, df):
         score += 10
         reasons.append("突破20日高")
 
-    # 成交量
     if vol_ratio >= 2.0:
         score += 16
         reasons.append("量比>=2")
@@ -363,14 +431,22 @@ def score_stock_daily(symbol, df):
     elif vol_ratio >= 1.2:
         score += 6
         reasons.append("量比>=1.2")
+    else:
+        score -= 4
+        warnings.append("量能不足")
 
-    # 动能
-    if change5 >= 6:
+    if 3 <= change5 <= 10:
         score += 12
-        reasons.append("5日强势")
-    elif change5 >= 3:
+        reasons.append("5日强势适中")
+    elif 10 < change5 <= 15:
         score += 8
-        reasons.append("5日偏强")
+        reasons.append("5日偏热")
+    elif change5 > 15:
+        score -= 8
+        warnings.append("5日涨幅过大")
+    elif change5 > 1:
+        score += 4
+        reasons.append("5日转强")
 
     if change20 >= 12:
         score += 8
@@ -379,70 +455,97 @@ def score_stock_daily(symbol, df):
         score += 4
         reasons.append("20日有升势")
 
-    # RSI
     if 55 <= rsi14 <= 72:
-        score += 8
+        score += 10
         reasons.append("RSI健康")
     elif 50 <= rsi14 < 55:
         score += 4
         reasons.append("RSI转强")
-    elif rsi14 > 78:
-        score -= 5
-        reasons.append("RSI过热")
-
-    # 流动性过滤
-    if last < 3:
-        score -= 12
-        reasons.append("价位过低")
-    elif last < 5:
+    elif 72 < rsi14 <= 80:
+        score += 2
+        warnings.append("RSI偏热")
+    elif 80 < rsi14 <= 85:
         score -= 6
-        reasons.append("低价股")
+        warnings.append("RSI过热")
+    elif rsi14 > 85:
+        score -= 15
+        warnings.append("RSI极热")
+
+    if last < 3:
+        score -= 15
+        warnings.append("股价太低")
+    elif last < 5:
+        score -= 8
+        warnings.append("低价股")
 
     if avg_vol50 < 800_000:
         score -= 10
-        reasons.append("量能偏低")
+        warnings.append("均量偏低")
     elif avg_vol50 < 1_500_000:
         score -= 4
-        reasons.append("均量一般")
+        warnings.append("均量一般")
 
-    # 偏离过大
-    extension = ((last - ma20) / ma20) * 100 if ma20 > 0 else 0
-    if extension > 12:
-        score -= 4
-        reasons.append("偏离MA20过大")
+    if extension > 15:
+        score -= 12
+        warnings.append("偏离MA20过大")
+    elif extension > 10:
+        score -= 6
+        warnings.append("离MA20偏远")
 
-    # 题材轻微加分
+    if 0 <= breakout_dist <= 1.0 and vol_ratio < 1.2:
+        score -= 8
+        warnings.append("疑似假突破")
+
     sector = find_sector(symbol)
-    if sector in {"AI_软件", "半导体", "量子", "太空_卫星_航天", "金融科技_支付_交易所", "小盘成长_高波动", "加密概念_矿股"}:
+    if sector in {
+        "AI_软件", "半导体", "量子", "太空_卫星_航天",
+        "金融科技_支付_交易所", "小盘成长_高波动", "加密概念_矿股"
+    }:
         score += 2
 
-    buy = round(last * 1.002, 2)
-    sl = round(min(low5, last * 0.97), 2)
-    tp1 = round(last * 1.05, 2)
-    tp2 = round(last * 1.08, 2)
+    entry_plan = build_smart_entry_plan(
+        last=last,
+        high10=high10,
+        high20=high20,
+        ma20=ma20,
+        atr=atr14,
+        rsi14=rsi14,
+        change5=change5,
+        vol_ratio=vol_ratio
+    )
 
     return {
         "symbol": symbol,
         "sector": sector,
         "score": round(score, 2),
         "price": round(last, 2),
-        "buy": buy,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
+        "buy": round((entry_plan["entry_low"] + entry_plan["entry_high"]) / 2, 2),
+        "buy_low": entry_plan["entry_low"],
+        "buy_high": entry_plan["entry_high"],
+        "buy_plan": entry_plan["plan"],
+        "buy_note": entry_plan["note"],
+        "sl": entry_plan["sl"],
+        "tp1": entry_plan["tp1"],
+        "tp2": entry_plan["tp2"],
         "rsi": round(rsi14, 1),
         "vol_ratio": round(vol_ratio, 2),
         "change1": round(change1, 2),
         "change5": round(change5, 2),
         "change20": round(change20, 2),
+        "extension": round(extension, 2),
+        "breakout_dist": round(breakout_dist, 2),
         "reasons": reasons[:5],
+        "warnings": warnings[:4],
     }
 
 def analyze_symbol(symbol):
     df = safe_download(symbol, period="6mo", interval="1d")
     if df is None:
         return None
-    return score_stock_daily(symbol, df)
+    result = score_stock_daily(symbol, df)
+    if not result:
+        return None
+    return result
 
 # ============================================================
 # 大盘过滤
@@ -511,7 +614,7 @@ def scan_batch(symbols):
                 res = future.result()
                 if res and res["score"] >= 42:
                     batch_results.append(res)
-            except:
+            except Exception:
                 pass
     return batch_results
 
@@ -535,12 +638,22 @@ def scan_all_daily():
 # 消息
 # ============================================================
 def build_premarket_message(results, regime):
-    top5 = results[:5]
-    reserve5 = results[5:10]
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    filtered = []
+    hot_names = []
+    for r in results:
+        if r["buy_plan"] == "不要追":
+            hot_names.append(r["symbol"])
+            continue
+        filtered.append(r)
+
+    display_top5 = filtered[:5] if len(filtered) >= 5 else results[:5]
+    reserve5 = filtered[5:10] if len(filtered) >= 10 else results[5:10]
     hot = build_sector_strength(results)
 
     lines = [
-        "🚀 V11 PRO 500股盘前扫描",
+        "🚀 V11.2 + V11.5 智能买点盘前扫描",
         f"{now_kl_str()} (KL)",
         "",
         f"📈 大盘状态：{regime['label']}",
@@ -554,16 +667,20 @@ def build_premarket_message(results, regime):
             lines.append(f"{i}. {sector} | 平均分 {avg_score} | 入选 {count}")
         lines.append("")
 
-    lines.append("🏆 今日最可能涨5%的 Top 5：")
+    lines.append("🏆 今日较优先关注 Top 5：")
     lines.append("")
 
-    for i, r in enumerate(top5, start=1):
-        logic = " / ".join(r["reasons"][:3])
+    for i, r in enumerate(display_top5, start=1):
+        logic = " / ".join(r["reasons"][:3]) if r["reasons"] else "趋势观察"
+        warn = " / ".join(r["warnings"][:2]) if r["warnings"] else "无明显过热"
         lines.append(f"{i}. {r['symbol']} ({r['score']}分) [{r['sector']}]")
-        lines.append(f"现价 {r['price']} | 买点 {r['buy']} | 止损 {r['sl']}")
+        lines.append(f"现价 {r['price']} | 策略：{r['buy_plan']}")
+        lines.append(f"买区 {r['buy_low']} - {r['buy_high']} | 止损 {r['sl']}")
         lines.append(f"TP1 {r['tp1']} | TP2 {r['tp2']}")
         lines.append(f"量比 {r['vol_ratio']} | RSI {r['rsi']} | 5日 {r['change5']}%")
         lines.append(f"逻辑：{logic}")
+        lines.append(f"提醒：{warn}")
+        lines.append(f"备注：{r['buy_note']}")
         lines.append("")
 
     if reserve5:
@@ -571,19 +688,25 @@ def build_premarket_message(results, regime):
         lines.append(", ".join([f"{x['symbol']}({x['score']})" for x in reserve5]))
         lines.append("")
 
+    if hot_names:
+        lines.append("⚠️ 过热暂不追名单：")
+        lines.append(", ".join(hot_names[:5]))
+        lines.append("")
+
     if regime["label"] == "DEFENSIVE":
         lines.append("⚠️ 建议：只做 Top1~2，仓位减半，不追高。")
     elif regime["label"] == "NEUTRAL":
         lines.append("⚠️ 建议：精选 Top1~3，不要全买。")
     else:
-        lines.append("✅ 建议：重点看 Top1~3，等确认再进。")
+        lines.append("✅ 建议：优先看“可追突破 / 等回踩买”的票，不做‘不要追’。")
 
     return "\n".join(lines)
 
 def build_close_message(results, regime):
-    reserve = results[:10]
+    reserve = sorted(results, key=lambda x: x["score"], reverse=True)[:10]
+
     lines = [
-        "🌙 V11 PRO 500股收盘扫描",
+        "🌙 V11.2 + V11.5 智能买点收盘扫描",
         f"{now_kl_str()} (KL)",
         "",
         f"📈 大盘状态：{regime['label']}",
@@ -594,11 +717,13 @@ def build_close_message(results, regime):
 
     for i, r in enumerate(reserve, start=1):
         lines.append(
-            f"{i}. {r['symbol']} ({r['score']}分) [{r['sector']}] | 价 {r['price']} | 买点 {r['buy']} | 止损 {r['sl']} | TP1 {r['tp1']}"
+            f"{i}. {r['symbol']} ({r['score']}分) [{r['sector']}] | "
+            f"策略 {r['buy_plan']} | 买区 {r['buy_low']}-{r['buy_high']} | "
+            f"止损 {r['sl']} | TP1 {r['tp1']}"
         )
 
     lines.append("")
-    lines.append("说明：这是收盘后整理好的明日观察名单。")
+    lines.append("说明：下一交易日优先看“可追突破 / 等回踩买”，跳过“不要追”。")
     return "\n".join(lines)
 
 # ============================================================
@@ -617,7 +742,7 @@ def run_premarket_scan():
 
     results = scan_all_daily()
     if not results:
-        send_telegram("⚠️ V11 PRO 500股盘前扫描完成，但没有明显强势股。")
+        send_telegram("⚠️ V11.2 + V11.5 盘前扫描完成，但没有明显强势股。")
         return {"status": "ok", "count": 0}
 
     top5 = results[:5]
@@ -643,7 +768,7 @@ def run_close_scan():
     regime = get_market_regime()
     results = scan_all_daily()
     if not results:
-        send_telegram("⚠️ V11 PRO 500股收盘扫描完成，但没有整理出明日预备股。")
+        send_telegram("⚠️ V11.2 + V11.5 收盘扫描完成，但没有整理出明日预备股。")
         return {"status": "ok", "count": 0}
 
     reserve = results[:10]
@@ -686,7 +811,7 @@ def analyze_intraday_breakout(symbol):
                 "vol_ratio": round(last_vol / avg_vol8, 2)
             }
         return None
-    except:
+    except Exception:
         return None
 
 def run_intraday_breakout_scan():
@@ -717,7 +842,7 @@ def run_intraday_breakout_scan():
                         if key not in INTRADAY_BREAKOUT_SENT:
                             alerts.append(res)
                             INTRADAY_BREAKOUT_SENT.add(key)
-                except:
+                except Exception:
                     pass
         time.sleep(0.8)
 
@@ -726,7 +851,7 @@ def run_intraday_breakout_scan():
 
     if alerts:
         lines = [
-            "⚡ V11 PRO 500股盘中突破提醒",
+            "⚡ V11.2 + V11.5 盘中突破提醒",
             f"{now_kl_str()} (KL)",
             ""
         ]
@@ -773,7 +898,7 @@ def scheduler_loop():
 # ============================================================
 @app.route("/")
 def home():
-    return "V11 PRO 500 Scanner Running"
+    return "V11.2 + V11.5 Scanner Running"
 
 @app.route("/health")
 def health():
