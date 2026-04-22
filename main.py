@@ -58,8 +58,8 @@ SECTOR_POOLS = {
     "AI_软件": [
         "PLTR","SOUN","BBAI","AI","PATH","U","APP","CRM","NOW","MDB",
         "SNOW","DDOG","NET","HUBS","TEAM","ASAN","BOX","ESTC","CFLT","DOCN",
-        "GTLB","DUOL","SPOT","ADBE","ORCL","SAP","WDAY","INTU","SMAR","S",
-        "RBRK","PEGA","PAYC","TWLO","ZI","FIVN","BILL","TOST","PCOR","PCTY"
+        "GTLB","DUOL","SPOT","ADBE","ORCL","SAP","WDAY","INTU","S",
+        "RBRK","PEGA","PAYC","TWLO","FIVN","BILL","TOST","PCOR","PCTY"
     ],
     "半导体": [
         "NVDA","AMD","AVGO","QCOM","MU","MRVL","ON","ARM","AMAT","LRCX",
@@ -75,7 +75,7 @@ SECTOR_POOLS = {
         "KTOS","AVAV","IRDM","GSAT","VSAT","MDAI","MNTS","BKSY","ACHR","JOBY"
     ],
     "金融科技_支付_交易所": [
-        "HOOD","SOFI","AFRM","COIN","PYPL","SQ","ALLY","NU","UPST","LC",
+        "HOOD","SOFI","AFRM","COIN","PYPL","ALLY","NU","UPST","LC",
         "PAGS","FOUR","BILL","TOST","INTU","MQ","GPN","FIS","JEF",
         "SCHW","IBKR","ICE","CME","NDAQ","MKTX","RKT","TREE","EXFY",
         "DLO","STNE","MELI"
