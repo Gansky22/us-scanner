@@ -76,12 +76,12 @@ SECTOR_POOLS = {
     ],
     "金融科技_支付_交易所": [
         "HOOD","SOFI","AFRM","COIN","PYPL","SQ","ALLY","NU","UPST","LC",
-        "PAGS","FOUR","BILL","TOST","INTU","MQ","GPN","FIS","FI","JEF",
-        "SCHW","IBKR","ICE","CME","NDAQ","MKTX","RKT","TREE","ENV","EXFY",
+        "PAGS","FOUR","BILL","TOST","INTU","MQ","GPN","FIS","JEF",
+        "SCHW","IBKR","ICE","CME","NDAQ","MKTX","RKT","TREE","EXFY",
         "DLO","STNE","MELI"
     ],
     "网络安全": [
-        "CRWD","PANW","ZS","OKTA","S","FTNT","CYBR","RBRK","TENB","GEN",
+        "CRWD","PANW","ZS","OKTA","S","FTNT","RBRK","TENB","GEN",
         "CHKP","QLYS","VRNS","NET","AKAM","DDOG","RSKD","BLZE","SAIL","OSPN",
         "CSCO","INFY"
     ],
@@ -95,17 +95,17 @@ SECTOR_POOLS = {
         "MRNA","VRTX","REGN","ALNY","EXEL","BEAM","CRSP","NTLA","RXRX","DNA",
         "SANA","NTRA","ILMN","BNTX","ARWR","NBIX","INSM","HALO","SRPT","VKTX",
         "HIMS","TEM","ABCL","GH","TWST","PACB","TXG","EDIT","ADMA","OMER",
-        "XENE","CYTK","MDGL","AKRO","MRUS","ARGX","ROIV","TGTX","ALKS"
+        "XENE","CYTK","MDGL","ARGX","ROIV","TGTX","ALKS"
     ],
     "加密概念_矿股": [
         "MSTR","COIN","MARA","RIOT","CLSK","CIFR","IREN","HUT","BTDR","BITF",
-        "WULF","CORZ","CAN","BTBT","GREE","HOOD","SQ","PYPL"
+        "WULF","CORZ","CAN","BTBT","GREE","HOOD","PYPL"
     ],
     "云计算_SaaS": [
         "CRM","NOW","SNOW","DDOG","NET","MDB","HUBS","TEAM","ASAN","BOX",
-        "WDAY","INTU","ADBE","ORCL","SAP","DOCN","CFLT","ZI","SMAR","ESTC",
-        "PCTY","PAYC","PCOR","APPF","BL","U","SHOP","BIGC","WIX","BAND",
-        "TWLO","FIVN","SPSC","HCP","FRSH","MNDY","GTLB","DUOL","PATH"
+        "WDAY","INTU","ADBE","ORCL","SAP","DOCN","CFLT","ESTC",
+        "PCTY","PAYC","PCOR","APPF","BL","U","SHOP","WIX","BAND",
+        "TWLO","FIVN","SPSC","FRSH","MNDY","GTLB","DUOL","PATH"
     ],
     "消费成长_平台_品牌": [
         "AMZN","MELI","ONON","CELH","CAVA","CMG","LULU","ABNB","DASH","RBLX",
@@ -133,17 +133,17 @@ SECTOR_POOLS = {
     ],
     "金融传统_银行_保险": [
         "JPM","BAC","WFC","C","GS","MS","AXP","BLK","BX","KKR",
-        "AIG","PGR","CB","TRV","ALL","MET","PRU","MMC","AJG","BRO",
-        "USB","PNC","TFC","COF","DFS","MCO","SPGI","CBRE","AON","RJF"
+        "AIG","PGR","CB","TRV","ALL","MET","PRU","AJG","BRO",
+        "USB","PNC","TFC","COF","MCO","SPGI","CBRE","AON","RJF"
     ],
     "能源_油气_LNG": [
         "XOM","CVX","COP","SLB","HAL","BKR","EOG","DVN","OXY","MPC",
         "VLO","PSX","KMI","WMB","LNG","CTRA","FANG","EQT","AR","APA",
-        "MRO","NOV","RRC","TPL"
+        "NOV","RRC","TPL"
     ],
     "材料_金属_矿业": [
-        "FCX","NUE","STLD","X","AA","CLF","RS","CMC","MLM","VMC",
-        "NEM","GOLD","AEM","SCCO","MP","LTHM","ALB","SQM","TECK","RIO",
+        "FCX","NUE","STLD","AA","CLF","RS","CMC","MLM","VMC",
+        "NEM","GOLD","AEM","SCCO","MP","ALB","SQM","TECK","RIO",
         "BHP","MOS","CF","NTR","IP"
     ],
     "医疗大盘_器械_服务": [
@@ -158,7 +158,7 @@ SECTOR_POOLS = {
     ],
     "旅游_航空_娱乐": [
         "UBER","BKNG","EXPE","CCL","RCL","NCLH","AAL","DAL","UAL","LUV",
-        "ALGT","MAR","HLT","WYNN","LVS","MGM","CHDN","DIS","WBD","PARA",
+        "ALGT","MAR","HLT","WYNN","LVS","MGM","CHDN","DIS","WBD",
         "JBLU"
     ]
 }
