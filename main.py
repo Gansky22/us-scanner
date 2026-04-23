@@ -41,6 +41,14 @@ BATCH_SLEEP = float(os.getenv("BATCH_SLEEP", "1.2"))
 
 TELEGRAM_MAX_LEN = 3500
 
+# ============================================================
+# V11.6 风控设定
+# ============================================================
+ACCOUNT_SIZE = float(os.getenv("ACCOUNT_SIZE", "5000"))
+MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.02"))
+MAX_POSITION_RATIO = float(os.getenv("MAX_POSITION_RATIO", "0.30"))
+
+MAX_LOSS_AMOUNT = ACCOUNT_SIZE * MAX_RISK_PER_TRADE
 TZ_KL = pytz.timezone("Asia/Kuala_Lumpur")
 TZ_ET = pytz.timezone("US/Eastern")
 
@@ -317,6 +325,36 @@ def find_sector(symbol):
             return sector
     return "其他"
 
+def build_v116_risk_plan(symbol, entry_price, sl, tp1, tp2):
+    if entry_price <= 0 or sl <= 0:
+        return None
+
+    risk_per_share = entry_price - sl
+
+    if risk_per_share <= 0:
+        return None
+
+    suggested_shares = int(MAX_LOSS_AMOUNT / risk_per_share)
+
+    max_position_value = ACCOUNT_SIZE * MAX_POSITION_RATIO
+    max_shares_by_capital = int(max_position_value / entry_price)
+
+    suggested_shares = min(suggested_shares, max_shares_by_capital)
+
+    if suggested_shares < 1:
+        suggested_shares = 1
+
+    position_value = suggested_shares * entry_price
+    estimated_max_loss = suggested_shares * risk_per_share
+
+    return {
+        "suggested_shares": suggested_shares,
+        "position_value": round(position_value, 2),
+        "risk_per_share": round(risk_per_share, 2),
+        "estimated_max_loss": round(estimated_max_loss, 2),
+        "max_loss_allowed": round(MAX_LOSS_AMOUNT, 2)
+    }
+    
 def build_smart_entry_plan(last, high10, high20, ma20, atr, rsi14, change5, vol_ratio):
     breakout_dist_pct = ((last - high10) / high10) * 100 if high10 > 0 else 0
     extension_pct = ((last - ma20) / ma20) * 100 if ma20 > 0 else 0
@@ -514,6 +552,14 @@ def score_stock_daily(symbol, df):
         vol_ratio=vol_ratio
     )
 
+    risk_plan = build_v116_risk_plan(
+    symbol=symbol,
+    entry_price=round((entry_plan["entry_low"] + entry_plan["entry_high"]) / 2, 2),
+    sl=entry_plan["sl"],
+    tp1=entry_plan["tp1"],
+    tp2=entry_plan["tp2"]
+    )
+    
     return {
         "symbol": symbol,
         "sector": sector,
@@ -536,6 +582,7 @@ def score_stock_daily(symbol, df):
         "breakout_dist": round(breakout_dist, 2),
         "reasons": reasons[:5],
         "warnings": warnings[:4],
+        "risk_plan": risk_plan,
     }
 
 def analyze_symbol(symbol):
@@ -677,6 +724,13 @@ def build_premarket_message(results, regime):
         lines.append(f"现价 {r['price']} | 策略：{r['buy_plan']}")
         lines.append(f"买区 {r['buy_low']} - {r['buy_high']} | 止损 {r['sl']}")
         lines.append(f"TP1 {r['tp1']} | TP2 {r['tp2']}")
+        rp = r.get("risk_plan")
+        if rp:
+            lines.append(
+                f"V11.6仓位：建议 {rp['suggested_shares']}股 | "
+                f"仓位 ${rp['position_value']} | "
+                f"本单最大亏损约 ${rp['estimated_max_loss']}"
+            )
         lines.append(f"量比 {r['vol_ratio']} | RSI {r['rsi']} | 5日 {r['change5']}%")
         lines.append(f"逻辑：{logic}")
         lines.append(f"提醒：{warn}")
@@ -716,10 +770,15 @@ def build_close_message(results, regime):
     ]
 
     for i, r in enumerate(reserve, start=1):
+        rp = r.get("risk_plan")
+        risk_text = ""
+        if rp:
+            risk_text = f" | 建议{rp['suggested_shares']}股 | 最大亏损${rp['estimated_max_loss']}"
+
         lines.append(
             f"{i}. {r['symbol']} ({r['score']}分) [{r['sector']}] | "
             f"策略 {r['buy_plan']} | 买区 {r['buy_low']}-{r['buy_high']} | "
-            f"止损 {r['sl']} | TP1 {r['tp1']}"
+            f"止损 {r['sl']} | TP1 {r['tp1']}{risk_text}"
         )
 
     lines.append("")
