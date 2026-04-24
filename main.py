@@ -1,14 +1,13 @@
 # ============================================================
-# 美股爆发扫描器 V11.2 + V11.5 智能买点版
-# Railway 付费版 / Flask / Telegram
+# 美股爆发扫描器 V12
+# Based on V11.2 + V11.5 + V11.6 Risk
 #
-# 功能：
-# 1) 盘前扫描：Top 5 + 预备股 5
-# 2) 盘中突破提醒
-# 3) 收盘明日预备股
-# 4) 500股扩容池
-# 5) V11.2 过滤过热股 / 假突破 / 涨太多
-# 6) V11.5 智能买点：可追突破 / 等回踩买 / 不要追
+# 新增：
+# 1) 隔日上涨分数 nextday_score
+# 2) 回测 endpoint: /run-backtest
+# 3) Top1 / Top3 / Top5 胜率统计
+# 4) +2% / +5% 盘中命中率
+# 5) 平均隔日收益
 # ============================================================
 
 import os
@@ -24,7 +23,7 @@ import pytz
 import requests
 import schedule
 import yfinance as yf
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
@@ -41,9 +40,6 @@ BATCH_SLEEP = float(os.getenv("BATCH_SLEEP", "1.2"))
 
 TELEGRAM_MAX_LEN = 3500
 
-# ============================================================
-# V11.6 风控设定
-# ============================================================
 ACCOUNT_SIZE = float(os.getenv("ACCOUNT_SIZE", "5000"))
 MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.02"))
 MAX_POSITION_RATIO = float(os.getenv("MAX_POSITION_RATIO", "0.30"))
@@ -59,8 +55,13 @@ LAST_CLOSE_SIGNATURE = ""
 LAST_MARKET_REGIME = ""
 INTRADAY_BREAKOUT_SENT = set()
 
+BAD_SYMBOLS = {
+    "X", "ZI", "ATVI", "FRC", "SIVB", "SVB", "BBBY", "TTCF", "TWTR", "FB",
+    "BRK.B", "BRK/B", "BF.B", "BF/B"
+}
+
 # ============================================================
-# 500股扩容版股票池
+# 股票池
 # ============================================================
 SECTOR_POOLS = {
     "AI_软件": [
@@ -171,7 +172,11 @@ SECTOR_POOLS = {
     ]
 }
 
-ALL_SYMBOLS = sorted(set([s for arr in SECTOR_POOLS.values() for s in arr]))
+ALL_SYMBOLS = sorted(set([
+    s for arr in SECTOR_POOLS.values()
+    for s in arr
+    if s not in BAD_SYMBOLS
+]))
 
 # ============================================================
 # 工具
@@ -243,20 +248,24 @@ def reset_daily_intraday_flags():
 def send_telegram(msg):
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram env missing")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     chunks = []
     text = msg.strip()
+
     while len(text) > TELEGRAM_MAX_LEN:
         split_at = text.rfind("\n", 0, TELEGRAM_MAX_LEN)
         if split_at == -1:
             split_at = TELEGRAM_MAX_LEN
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip()
+
     if text:
         chunks.append(text)
+
+    success = True
 
     for chunk in chunks:
         payload = {"chat_id": CHAT_ID, "text": chunk}
@@ -270,13 +279,20 @@ def send_telegram(msg):
             except Exception:
                 pass
             time.sleep(2)
+
         if not ok:
+            success = False
             print("Telegram send failed")
+
+    return success
 
 # ============================================================
 # 下载
 # ============================================================
 def safe_download(symbol, period="6mo", interval="1d"):
+    if symbol in BAD_SYMBOLS:
+        return None
+
     try:
         df = yf.download(
             symbol,
@@ -286,11 +302,24 @@ def safe_download(symbol, period="6mo", interval="1d"):
             progress=False,
             threads=False
         )
+
         if df is None or df.empty:
             return None
+
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        return df.dropna()
+
+        needed = {"Open", "High", "Low", "Close", "Volume"}
+        if not needed.issubset(set(df.columns)):
+            return None
+
+        df = df.dropna()
+
+        if len(df) < 30:
+            return None
+
+        return df
+
     except Exception:
         return None
 
@@ -325,6 +354,79 @@ def find_sector(symbol):
             return sector
     return "其他"
 
+# ============================================================
+# V12 隔日上涨评分
+# ============================================================
+def calc_nextday_score_from_values(vol_ratio, buy_plan, rsi, change5, extension, change1, breakout_dist):
+    score = 0
+
+    if vol_ratio >= 2.5:
+        score += 25
+    elif vol_ratio >= 2.0:
+        score += 22
+    elif vol_ratio >= 1.5:
+        score += 16
+    elif vol_ratio >= 1.2:
+        score += 8
+
+    if buy_plan == "可追突破":
+        score += 25
+    elif buy_plan == "接近买点":
+        score += 16
+    elif buy_plan == "等回踩买":
+        score += 8
+    elif buy_plan == "不要追":
+        score -= 12
+
+    if 55 <= rsi <= 68:
+        score += 20
+    elif 68 < rsi <= 75:
+        score += 12
+    elif 50 <= rsi < 55:
+        score += 6
+    elif rsi > 80:
+        score -= 10
+
+    if 3 <= change5 <= 10:
+        score += 15
+    elif 1 <= change5 < 3:
+        score += 8
+    elif 10 < change5 <= 15:
+        score += 5
+    elif change5 > 15:
+        score -= 12
+
+    if extension <= 5:
+        score += 15
+    elif 5 < extension <= 9:
+        score += 8
+    elif 9 < extension <= 14:
+        score += 2
+    elif extension > 14:
+        score -= 12
+
+    if change1 > 12:
+        score -= 10
+    elif change1 < -3:
+        score -= 8
+
+    if 0 <= breakout_dist <= 3:
+        score += 8
+
+    return max(0, min(100, round(score, 1)))
+
+def nextday_grade(score):
+    if score >= 80:
+        return "A+ 隔日强势候选"
+    if score >= 70:
+        return "A 可重点观察"
+    if score >= 60:
+        return "B 可观察"
+    return "C 暂不优先"
+
+# ============================================================
+# 风控与买点
+# ============================================================
 def build_v116_risk_plan(symbol, entry_price, sl, tp1, tp2):
     if entry_price <= 0 or sl <= 0:
         return None
@@ -354,7 +456,7 @@ def build_v116_risk_plan(symbol, entry_price, sl, tp1, tp2):
         "estimated_max_loss": round(estimated_max_loss, 2),
         "max_loss_allowed": round(MAX_LOSS_AMOUNT, 2)
     }
-    
+
 def build_smart_entry_plan(last, high10, high20, ma20, atr, rsi14, change5, vol_ratio):
     breakout_dist_pct = ((last - high10) / high10) * 100 if high10 > 0 else 0
     extension_pct = ((last - ma20) / ma20) * 100 if ma20 > 0 else 0
@@ -405,6 +507,9 @@ def build_smart_entry_plan(last, high10, high20, ma20, atr, rsi14, change5, vol_
         "extension_pct": round(extension_pct, 2),
     }
 
+# ============================================================
+# 每日评分
+# ============================================================
 def score_stock_daily(symbol, df):
     if df is None or len(df) < 70:
         return None
@@ -430,7 +535,7 @@ def score_stock_daily(symbol, df):
 
     rsi14 = float(calc_rsi(close, 14).iloc[-1])
     atr14_series = calc_atr(df, 14)
-    atr14 = float(atr14_series.iloc[-1]) if not atr14_series.empty else last * 0.03
+    atr14 = float(atr14_series.iloc[-1]) if not atr14_series.empty and not math.isnan(float(atr14_series.iloc[-1])) else last * 0.03
 
     vol_ratio = float(vol.iloc[-1] / avg_vol20) if avg_vol20 > 0 else 0
     change1 = ((last - prev) / prev) * 100 if prev > 0 else 0
@@ -535,6 +640,7 @@ def score_stock_daily(symbol, df):
         warnings.append("疑似假突破")
 
     sector = find_sector(symbol)
+
     if sector in {
         "AI_软件", "半导体", "量子", "太空_卫星_航天",
         "金融科技_支付_交易所", "小盘成长_高波动", "加密概念_矿股"
@@ -552,18 +658,30 @@ def score_stock_daily(symbol, df):
         vol_ratio=vol_ratio
     )
 
-    risk_plan = build_v116_risk_plan(
-    symbol=symbol,
-    entry_price=round((entry_plan["entry_low"] + entry_plan["entry_high"]) / 2, 2),
-    sl=entry_plan["sl"],
-    tp1=entry_plan["tp1"],
-    tp2=entry_plan["tp2"]
+    nextday_score = calc_nextday_score_from_values(
+        vol_ratio=vol_ratio,
+        buy_plan=entry_plan["plan"],
+        rsi=rsi14,
+        change5=change5,
+        extension=extension,
+        change1=change1,
+        breakout_dist=breakout_dist
     )
-    
+
+    risk_plan = build_v116_risk_plan(
+        symbol=symbol,
+        entry_price=round((entry_plan["entry_low"] + entry_plan["entry_high"]) / 2, 2),
+        sl=entry_plan["sl"],
+        tp1=entry_plan["tp1"],
+        tp2=entry_plan["tp2"]
+    )
+
     return {
         "symbol": symbol,
         "sector": sector,
         "score": round(score, 2),
+        "nextday_score": nextday_score,
+        "nextday_grade": nextday_grade(nextday_score),
         "price": round(last, 2),
         "buy": round((entry_plan["entry_low"] + entry_plan["entry_high"]) / 2, 2),
         "buy_low": entry_plan["entry_low"],
@@ -589,10 +707,7 @@ def analyze_symbol(symbol):
     df = safe_download(symbol, period="6mo", interval="1d")
     if df is None:
         return None
-    result = score_stock_daily(symbol, df)
-    if not result:
-        return None
-    return result
+    return score_stock_daily(symbol, df)
 
 # ============================================================
 # 大盘过滤
@@ -678,17 +793,26 @@ def scan_all_daily():
         if idx < total_batches:
             time.sleep(BATCH_SLEEP)
 
-    all_results.sort(key=lambda x: x["score"], reverse=True)
+    all_results.sort(
+        key=lambda x: (x.get("nextday_score", 0), x.get("score", 0)),
+        reverse=True
+    )
+
     return all_results
 
 # ============================================================
 # 消息
 # ============================================================
 def build_premarket_message(results, regime):
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
+    results = sorted(
+        results,
+        key=lambda x: (x.get("nextday_score", 0), x.get("score", 0)),
+        reverse=True
+    )
 
     filtered = []
     hot_names = []
+
     for r in results:
         if r["buy_plan"] == "不要追":
             hot_names.append(r["symbol"])
@@ -700,7 +824,7 @@ def build_premarket_message(results, regime):
     hot = build_sector_strength(results)
 
     lines = [
-        "🚀 V11.2 + V11.5 智能买点盘前扫描",
+        "🚀 V12 隔日上涨 + V11.5 智能买点盘前扫描",
         f"{now_kl_str()} (KL)",
         "",
         f"📈 大盘状态：{regime['label']}",
@@ -720,17 +844,21 @@ def build_premarket_message(results, regime):
     for i, r in enumerate(display_top5, start=1):
         logic = " / ".join(r["reasons"][:3]) if r["reasons"] else "趋势观察"
         warn = " / ".join(r["warnings"][:2]) if r["warnings"] else "无明显过热"
+
         lines.append(f"{i}. {r['symbol']} ({r['score']}分) [{r['sector']}]")
+        lines.append(f"隔日上涨分数：{r.get('nextday_score', '-')}/100 | {r.get('nextday_grade', '-')}")
         lines.append(f"现价 {r['price']} | 策略：{r['buy_plan']}")
         lines.append(f"买区 {r['buy_low']} - {r['buy_high']} | 止损 {r['sl']}")
         lines.append(f"TP1 {r['tp1']} | TP2 {r['tp2']}")
+
         rp = r.get("risk_plan")
         if rp:
             lines.append(
-                f"V11.6仓位：建议 {rp['suggested_shares']}股 | "
+                f"仓位建议：{rp['suggested_shares']}股 | "
                 f"仓位 ${rp['position_value']} | "
                 f"本单最大亏损约 ${rp['estimated_max_loss']}"
             )
+
         lines.append(f"量比 {r['vol_ratio']} | RSI {r['rsi']} | 5日 {r['change5']}%")
         lines.append(f"逻辑：{logic}")
         lines.append(f"提醒：{warn}")
@@ -739,7 +867,7 @@ def build_premarket_message(results, regime):
 
     if reserve5:
         lines.append("🌙 预备股 5只：")
-        lines.append(", ".join([f"{x['symbol']}({x['score']})" for x in reserve5]))
+        lines.append(", ".join([f"{x['symbol']}({x.get('nextday_score', x['score'])})" for x in reserve5]))
         lines.append("")
 
     if hot_names:
@@ -752,15 +880,19 @@ def build_premarket_message(results, regime):
     elif regime["label"] == "NEUTRAL":
         lines.append("⚠️ 建议：精选 Top1~3，不要全买。")
     else:
-        lines.append("✅ 建议：优先看“可追突破 / 等回踩买”的票，不做‘不要追’。")
+        lines.append("✅ 建议：优先看 nextday_score 高 + 可追突破 / 接近买点。")
 
     return "\n".join(lines)
 
 def build_close_message(results, regime):
-    reserve = sorted(results, key=lambda x: x["score"], reverse=True)[:10]
+    reserve = sorted(
+        results,
+        key=lambda x: (x.get("nextday_score", 0), x.get("score", 0)),
+        reverse=True
+    )[:10]
 
     lines = [
-        "🌙 V11.2 + V11.5 智能买点收盘扫描",
+        "🌙 V12 隔日上涨收盘扫描",
         f"{now_kl_str()} (KL)",
         "",
         f"📈 大盘状态：{regime['label']}",
@@ -772,17 +904,20 @@ def build_close_message(results, regime):
     for i, r in enumerate(reserve, start=1):
         rp = r.get("risk_plan")
         risk_text = ""
+
         if rp:
             risk_text = f" | 建议{rp['suggested_shares']}股 | 最大亏损${rp['estimated_max_loss']}"
 
         lines.append(
-            f"{i}. {r['symbol']} ({r['score']}分) [{r['sector']}] | "
+            f"{i}. {r['symbol']} | 隔日分 {r.get('nextday_score','-')}/100 | "
+            f"{r.get('nextday_grade','-')} | 原分 {r['score']} | "
             f"策略 {r['buy_plan']} | 买区 {r['buy_low']}-{r['buy_high']} | "
             f"止损 {r['sl']} | TP1 {r['tp1']}{risk_text}"
         )
 
     lines.append("")
-    lines.append("说明：下一交易日优先看“可追突破 / 等回踩买”，跳过“不要追”。")
+    lines.append("说明：下一交易日优先看隔日分数高、量能配合、不过热的票。")
+
     return "\n".join(lines)
 
 # ============================================================
@@ -800,12 +935,13 @@ def run_premarket_scan():
     LAST_MARKET_REGIME = regime["label"]
 
     results = scan_all_daily()
+
     if not results:
-        send_telegram("⚠️ V11.2 + V11.5 盘前扫描完成，但没有明显强势股。")
+        send_telegram("⚠️ V12 盘前扫描完成，但没有明显强势股。")
         return {"status": "ok", "count": 0}
 
     top5 = results[:5]
-    signature = "|".join([f"{x['symbol']}:{x['score']}" for x in top5])
+    signature = "|".join([f"{x['symbol']}:{x.get('nextday_score', x['score'])}" for x in top5])
 
     if signature == LAST_PREMARKET_SIGNATURE:
         return {"status": "ok", "message": "unchanged"}
@@ -816,7 +952,12 @@ def run_premarket_scan():
     msg = build_premarket_message(results, regime)
     send_telegram(msg)
 
-    return {"status": "ok", "count": len(results), "top5": [x["symbol"] for x in top5]}
+    return {
+        "status": "ok",
+        "count": len(results),
+        "top5": [x["symbol"] for x in top5],
+        "results": top5
+    }
 
 def run_close_scan():
     global LAST_CLOSE_SIGNATURE
@@ -826,12 +967,13 @@ def run_close_scan():
 
     regime = get_market_regime()
     results = scan_all_daily()
+
     if not results:
-        send_telegram("⚠️ V11.2 + V11.5 收盘扫描完成，但没有整理出明日预备股。")
+        send_telegram("⚠️ V12 收盘扫描完成，但没有整理出明日预备股。")
         return {"status": "ok", "count": 0}
 
     reserve = results[:10]
-    signature = "|".join([f"{x['symbol']}:{x['score']}" for x in reserve])
+    signature = "|".join([f"{x['symbol']}:{x.get('nextday_score', x['score'])}" for x in reserve])
 
     if signature == LAST_CLOSE_SIGNATURE:
         return {"status": "ok", "message": "unchanged"}
@@ -842,7 +984,12 @@ def run_close_scan():
     msg = build_close_message(results, regime)
     send_telegram(msg)
 
-    return {"status": "ok", "count": len(results), "reserve10": [x["symbol"] for x in reserve]}
+    return {
+        "status": "ok",
+        "count": len(results),
+        "reserve10": [x["symbol"] for x in reserve],
+        "results": reserve
+    }
 
 # ============================================================
 # 盘中突破
@@ -850,6 +997,7 @@ def run_close_scan():
 def analyze_intraday_breakout(symbol):
     try:
         df = safe_download(symbol, period="5d", interval="15m")
+
         if df is None or len(df) < 30:
             return None
 
@@ -869,7 +1017,9 @@ def analyze_intraday_breakout(symbol):
                 "prev_high": round(prev_high, 2),
                 "vol_ratio": round(last_vol / avg_vol8, 2)
             }
+
         return None
+
     except Exception:
         return None
 
@@ -890,19 +1040,25 @@ def run_intraday_breakout_scan():
     ))
 
     alerts = []
+
     for batch in chunk_list(focus_symbols, 40):
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, 12)) as executor:
             futures = {executor.submit(analyze_intraday_breakout, s): s for s in batch}
+
             for future in as_completed(futures):
                 try:
                     res = future.result()
+
                     if res:
                         key = f"{res['symbol']}_{now_et().strftime('%Y-%m-%d')}"
+
                         if key not in INTRADAY_BREAKOUT_SENT:
                             alerts.append(res)
                             INTRADAY_BREAKOUT_SENT.add(key)
+
                 except Exception:
                     pass
+
         time.sleep(0.8)
 
     alerts.sort(key=lambda x: x["vol_ratio"], reverse=True)
@@ -910,14 +1066,16 @@ def run_intraday_breakout_scan():
 
     if alerts:
         lines = [
-            "⚡ V11.2 + V11.5 盘中突破提醒",
+            "⚡ V12 盘中突破提醒",
             f"{now_kl_str()} (KL)",
             ""
         ]
+
         for i, a in enumerate(alerts, start=1):
             lines.append(
                 f"{i}. {a['symbol']} 突破中 | 现价 {a['price']} | 前高 {a['prev_high']} | 量比 {a['vol_ratio']}"
             )
+
         lines.append("")
         lines.append("提示：盘中突破波动快，尽量不要追太高。")
 
@@ -925,6 +1083,131 @@ def run_intraday_breakout_scan():
         save_state()
 
     return {"status": "ok", "alerts": alerts}
+
+# ============================================================
+# 回测
+# ============================================================
+def calc_backtest_score_at_index(df, i):
+    if df is None or i < 70 or i + 1 >= len(df):
+        return None
+
+    try:
+        sub = df.iloc[:i+1].copy()
+        result = score_stock_daily("BACKTEST", sub)
+
+        if not result:
+            return None
+
+        return result.get("nextday_score", 0)
+
+    except Exception:
+        return None
+
+def run_backtest_core(days=90, top_n=5, min_score=0, period="6mo"):
+    all_data = {}
+
+    for symbol in ALL_SYMBOLS:
+        df = safe_download(symbol, period=period, interval="1d")
+
+        if df is not None and len(df) >= 80:
+            all_data[symbol] = df
+
+    if not all_data:
+        return {
+            "status": "error",
+            "message": "No stock data downloaded"
+        }
+
+    min_len = min(len(df) for df in all_data.values())
+
+    start_index = max(70, min_len - days - 1)
+    end_index = min_len - 2
+
+    results_by_day = []
+
+    for i in range(start_index, end_index):
+        daily_scores = []
+
+        for symbol, df in all_data.items():
+            if len(df) <= i + 1:
+                continue
+
+            try:
+                score = calc_backtest_score_at_index(df, i)
+
+                if score is None or score < min_score:
+                    continue
+
+                today_close = float(df["Close"].iloc[i])
+                next_close = float(df["Close"].iloc[i + 1])
+                next_high = float(df["High"].iloc[i + 1])
+                next_low = float(df["Low"].iloc[i + 1])
+
+                if today_close <= 0:
+                    continue
+
+                nextday_return = (next_close / today_close - 1) * 100
+                nextday_high_return = (next_high / today_close - 1) * 100
+                nextday_low_return = (next_low / today_close - 1) * 100
+
+                daily_scores.append({
+                    "symbol": symbol,
+                    "score": round(score, 1),
+                    "nextday_return": round(nextday_return, 2),
+                    "nextday_high_return": round(nextday_high_return, 2),
+                    "nextday_low_return": round(nextday_low_return, 2)
+                })
+
+            except Exception:
+                continue
+
+        daily_scores = sorted(daily_scores, key=lambda x: x["score"], reverse=True)
+
+        if daily_scores:
+            results_by_day.append(daily_scores[:top_n])
+
+    flat = [item for day in results_by_day for item in day]
+
+    if not flat:
+        return {
+            "status": "error",
+            "message": "No backtest result found"
+        }
+
+    def stat(items):
+        if not items:
+            return {}
+
+        total = len(items)
+
+        return {
+            "total_trades": total,
+            "nextday_close_green_rate": round(sum(1 for x in items if x["nextday_return"] > 0) / total * 100, 2),
+            "intraday_2pct_hit_rate": round(sum(1 for x in items if x["nextday_high_return"] >= 2) / total * 100, 2),
+            "intraday_5pct_hit_rate": round(sum(1 for x in items if x["nextday_high_return"] >= 5) / total * 100, 2),
+            "avg_nextday_close_return": round(sum(x["nextday_return"] for x in items) / total, 2),
+            "avg_nextday_high_return": round(sum(x["nextday_high_return"] for x in items) / total, 2),
+            "avg_nextday_low_return": round(sum(x["nextday_low_return"] for x in items) / total, 2),
+            "best_trade": max(items, key=lambda x: x["nextday_high_return"]),
+            "worst_trade": min(items, key=lambda x: x["nextday_return"])
+        }
+
+    top1_flat = [day[0] for day in results_by_day if len(day) >= 1]
+    top3_flat = [item for day in results_by_day for item in day[:3]]
+    top5_flat = [item for day in results_by_day for item in day[:5]]
+
+    return {
+        "status": "ok",
+        "backtest_days": days,
+        "period": period,
+        "stock_count": len(all_data),
+        "top_n": top_n,
+        "min_score": min_score,
+        "summary_all": stat(flat),
+        "top1_stats": stat(top1_flat),
+        "top3_stats": stat(top3_flat),
+        "top5_stats": stat(top5_flat),
+    }
 
 # ============================================================
 # 排程
@@ -950,6 +1233,7 @@ def scheduler_loop():
             schedule.run_pending()
         except Exception as e:
             print("scheduler error:", e)
+
         time.sleep(15)
 
 # ============================================================
@@ -957,16 +1241,18 @@ def scheduler_loop():
 # ============================================================
 @app.route("/")
 def home():
-    return "V11.2 + V11.5 Scanner Running"
+    return "V12 Nextday Scanner Running"
 
 @app.route("/health")
 def health():
     return jsonify({
         "status": "healthy",
         "time_kl": now_kl_str(),
+        "time_et": now_et().strftime("%Y-%m-%d %H:%M:%S"),
         "symbols": len(ALL_SYMBOLS),
         "max_workers": MAX_WORKERS,
-        "batch_size": BATCH_SIZE
+        "batch_size": BATCH_SIZE,
+        "version": "V12_nextday_backtest"
     })
 
 @app.route("/run-premarket")
@@ -981,12 +1267,34 @@ def route_run_intraday():
 def route_run_close():
     return jsonify(run_close_scan())
 
+@app.route("/run-backtest")
+def route_run_backtest():
+    days = int(request.args.get("days", 90))
+    top_n = int(request.args.get("top", 5))
+    min_score = int(request.args.get("min_score", 0))
+    period = request.args.get("period", "6mo")
+
+    return jsonify(run_backtest_core(
+        days=days,
+        top_n=top_n,
+        min_score=min_score,
+        period=period
+    ))
+
 @app.route("/sectors")
 def route_sectors():
     return jsonify({
         "sector_count": len(SECTOR_POOLS),
         "total_symbols": len(ALL_SYMBOLS),
         "sectors": {k: len(v) for k, v in SECTOR_POOLS.items()}
+    })
+
+@app.route("/api/test-telegram")
+def route_test_telegram():
+    ok = send_telegram("✅ V12 Telegram Test Success")
+    return jsonify({
+        "status": "ok" if ok else "error",
+        "telegram_sent": ok
     })
 
 # ============================================================
