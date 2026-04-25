@@ -15,12 +15,6 @@ from flask import Flask, jsonify, request
 
 app = Flask(name)
 
-============================================================
-
-ENV
-
-============================================================
-
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip() PORT = int(os.getenv("PORT", "5000"))
 
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20")) BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50")) BATCH_SLEEP = float(os.getenv("BATCH_SLEEP", "1.2"))
