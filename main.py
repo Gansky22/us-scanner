@@ -275,6 +275,16 @@ def build_risk(entry_price, sl):
     }
 
 
+def capital_grade(score):
+    if score >= 80:
+        return "A 强主力"
+    if score >= 65:
+        return "B 有资金"
+    if score >= 50:
+        return "C 观察"
+    return "D 弱"
+
+
 def score_stock(symbol, df):
     if df is None or len(df) < 70:
         return None
@@ -289,17 +299,57 @@ def score_stock(symbol, df):
 
     ma20 = float(close.rolling(20).mean().iloc[-1])
     ma50 = float(close.rolling(50).mean().iloc[-1])
-
     high10 = float(high.iloc[-10:-1].max())
 
     avg_vol20 = float(vol.rolling(20).mean().iloc[-1])
+    avg_vol50 = float(vol.rolling(50).mean().iloc[-1])
 
     vol_ratio = float(vol.iloc[-1] / avg_vol20) if avg_vol20 > 0 else 0
-
     rsi = float(calc_rsi(close).iloc[-1])
 
     change1 = (last - prev) / prev * 100
     change5 = (last - float(close.iloc[-6])) / float(close.iloc[-6]) * 100
+
+    obv = calc_obv(close, vol)
+    obv20 = float(obv.iloc[-1] - obv.iloc[-21])
+    obv50 = float(obv.iloc[-1] - obv.iloc[-51])
+
+    recent_close = close.iloc[-20:]
+    recent_vol = vol.iloc[-20:]
+    prev_close = close.shift(1).iloc[-20:]
+
+    up_days = recent_close > prev_close
+    down_days = recent_close < prev_close
+
+    up_vol = float(recent_vol[up_days].sum())
+    down_vol = float(recent_vol[down_days].sum())
+    absorb_ratio = up_vol / down_vol if down_vol > 0 else 1
+
+    money_score = 0
+
+    if vol_ratio >= 2:
+        money_score += 25
+    elif vol_ratio >= 1.5:
+        money_score += 18
+    elif vol_ratio >= 1.2:
+        money_score += 10
+
+    if obv20 > 0:
+        money_score += 20
+
+    if obv50 > 0:
+        money_score += 15
+
+    if absorb_ratio >= 1.5:
+        money_score += 25
+    elif absorb_ratio >= 1.2:
+        money_score += 15
+
+    if change1 > 0 and vol_ratio >= 1.3:
+        money_score += 15
+
+    money_score = max(0, min(100, round(money_score, 1)))
+    money_level = capital_grade(money_score)
 
     score = 0
     reasons = []
@@ -328,8 +378,23 @@ def score_stock(symbol, df):
         score += 10
         reasons.append("5日强势")
 
+    if money_score >= 65:
+        score += 12
+        reasons.append("主力资金流入")
+
     if last < 3:
         score -= 15
+
+    breakout_prob = min(95, max(20, round(score * 0.7 + money_score * 0.3, 1)))
+
+    if breakout_prob >= 80:
+        launch_time = "1-3天内可能启动"
+    elif breakout_prob >= 65:
+        launch_time = "3-7天观察"
+    elif breakout_prob >= 50:
+        launch_time = "等待确认"
+    else:
+        launch_time = "暂时不优先"
 
     buy_low = round(last * 0.995, 2)
     buy_high = round(last * 1.01, 2)
@@ -342,7 +407,7 @@ def score_stock(symbol, df):
     tp1 = round(last + atr * 2, 2)
     tp2 = round(last + atr * 3.5, 2)
 
-    risk = build_risk((buy_low + buy_high)/2, sl)
+    risk = build_risk((buy_low + buy_high) / 2, sl)
 
     return {
         "symbol": symbol,
@@ -358,6 +423,11 @@ def score_stock(symbol, df):
         "vol_ratio": round(vol_ratio, 2),
         "change1": round(change1, 2),
         "change5": round(change5, 2),
+        "money_score": money_score,
+        "money_level": money_level,
+        "breakout_prob": breakout_prob,
+        "launch_time": launch_time,
+        "absorb_ratio": round(absorb_ratio, 2),
         "reasons": reasons[:5],
         "risk": risk
     }
@@ -391,13 +461,26 @@ def score_bottom(symbol, df):
 
     obv = calc_obv(close, vol)
     obv20 = float(obv.iloc[-1] - obv.iloc[-21])
+    obv60 = float(obv.iloc[-1] - obv.iloc[-61])
+
+    recent_close = close.iloc[-20:]
+    recent_vol = vol.iloc[-20:]
+    prev_close = close.shift(1).iloc[-20:]
+
+    up_days = recent_close > prev_close
+    down_days = recent_close < prev_close
+
+    up_vol = float(recent_vol[up_days].sum())
+    down_vol = float(recent_vol[down_days].sum())
+    absorb_ratio = up_vol / down_vol if down_vol > 0 else 1
 
     dist_low = (last - low52) / low52 * 100
-
     range20 = (high20 - low20) / low20 * 100
 
     score = 0
     reasons = []
+
+    money_score = 0
 
     if 5 <= dist_low <= 45:
         score += 20
@@ -417,7 +500,11 @@ def score_bottom(symbol, df):
 
     if obv20 > 0:
         score += 15
+        money_score += 20
         reasons.append("OBV转强")
+
+    if obv60 > 0:
+        money_score += 20
 
     if 45 <= rsi <= 65:
         score += 10
@@ -425,10 +512,38 @@ def score_bottom(symbol, df):
 
     if vol_ratio >= 1.3:
         score += 10
+        money_score += 15
         reasons.append("量能增加")
+
+    if absorb_ratio >= 1.5:
+        score += 15
+        money_score += 30
+        reasons.append("上涨量大于下跌量")
+    elif absorb_ratio >= 1.2:
+        score += 8
+        money_score += 18
+        reasons.append("疑似吸筹")
+
+    if 0 <= ((high20 - last) / last * 100) <= 6:
+        score += 10
+        reasons.append("接近突破位")
+
+    money_score = max(0, min(100, round(money_score, 1)))
+    money_level = capital_grade(money_score)
 
     if score < 52:
         return None
+
+    breakout_prob = min(95, max(20, round(score * 0.65 + money_score * 0.35, 1)))
+
+    if breakout_prob >= 80:
+        launch_time = "1-5天内可能启动"
+    elif breakout_prob >= 65:
+        launch_time = "3-10天观察"
+    elif breakout_prob >= 50:
+        launch_time = "等放量突破"
+    else:
+        launch_time = "暂时不优先"
 
     buy_low = round(last * 0.98, 2)
     buy_high = round(last * 1.03, 2)
@@ -441,7 +556,7 @@ def score_bottom(symbol, df):
     tp1 = round(last + atr * 2.2, 2)
     tp2 = round(last + atr * 4.0, 2)
 
-    risk = build_risk((buy_low + buy_high)/2, sl)
+    risk = build_risk((buy_low + buy_high) / 2, sl)
 
     return {
         "symbol": symbol,
@@ -455,6 +570,13 @@ def score_bottom(symbol, df):
         "tp2": tp2,
         "rsi": round(rsi, 1),
         "vol_ratio": round(vol_ratio, 2),
+        "money_score": money_score,
+        "money_level": money_level,
+        "breakout_prob": breakout_prob,
+        "launch_time": launch_time,
+        "absorb_ratio": round(absorb_ratio, 2),
+        "dist_low": round(dist_low, 2),
+        "range20": round(range20, 2),
         "reasons": reasons[:5],
         "risk": risk
     }
@@ -551,6 +673,11 @@ def build_text(title, arr):
     ]
 
     for i, r in enumerate(arr, start=1):
+        money = r.get("money_level", "-")
+        prob = r.get("breakout_prob", "-")
+        launch = r.get("launch_time", "-")
+        absorb = r.get("absorb_ratio", "-")
+
         lines.append(
             f"{i}. {r['symbol']} {r['score']}分 "
             f"| 价 {r['price']} "
@@ -558,6 +685,20 @@ def build_text(title, arr):
             f"| SL {r['sl']} "
             f"| TP1 {r['tp1']}"
         )
+        lines.append(
+            f"主力资金: {money} | 爆发概率: {prob}% | 吸筹强度: {absorb} | {launch}"
+        )
+
+        if r.get("reasons"):
+            lines.append("逻辑: " + " / ".join(r["reasons"]))
+
+        risk = r.get("risk")
+        if risk:
+            lines.append(
+                f"仓位: {risk['shares']}股 | 约${risk['position_value']} | 最大亏损约${risk['max_loss']}"
+            )
+
+        lines.append("")
 
     return "\n".join(lines)
 
