@@ -2,9 +2,8 @@ import os
 import time 
 import math 
 import json 
-import threading 
-from datetime import datetime 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading from datetime 
+import datetime from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd 
 import pytz 
@@ -14,6 +13,12 @@ import yfinance as yf
 from flask import Flask, jsonify, request
 
 app = Flask(name)
+
+============================================================
+
+ENV
+
+============================================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip() PORT = int(os.getenv("PORT", "5000"))
 
