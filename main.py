@@ -274,6 +274,48 @@ def build_risk(entry_price, sl):
         "max_loss": round(shares * risk_per_share, 2)
     }
 
+def count_green_days(close, lookback=6):
+    count = 0
+    for i in range(len(close) - 1, max(len(close) - lookback - 1, 0), -1):
+        if close.iloc[i] > close.iloc[i - 1]:
+            count += 1
+        else:
+            break
+    return count
+
+
+def anti_chase_status(last, ma10, ma20, rsi, change5, green_days, market_mode):
+    extension_ma10 = ((last - ma10) / ma10) * 100 if ma10 > 0 else 0
+    extension_ma20 = ((last - ma20) / ma20) * 100 if ma20 > 0 else 0
+
+    danger = []
+    status = "可买"
+
+    if rsi >= 78:
+        danger.append("RSI过热")
+
+    if green_days >= 4:
+        danger.append("连续上涨过多")
+
+    if extension_ma10 >= 8:
+        danger.append("离MA10过远")
+
+    if extension_ma20 >= 15:
+        danger.append("离MA20过远")
+
+    if change5 >= 15:
+        danger.append("5日涨幅过大")
+
+    if market_mode in ["DEFENSIVE", "NEUTRAL"] and len(danger) >= 2:
+        status = "禁追"
+    elif len(danger) >= 2:
+        status = "等回踩"
+    elif len(danger) == 1:
+        status = "观察"
+    else:
+        status = "可买"
+
+    return status, danger, round(extension_ma10, 2), round(extension_ma20, 2)
 
 def capital_grade(score):
     if score >= 80:
@@ -297,6 +339,7 @@ def score_stock(symbol, df):
     last = float(close.iloc[-1])
     prev = float(close.iloc[-2])
 
+    ma10 = float(close.rolling(10).mean().iloc[-1])
     ma20 = float(close.rolling(20).mean().iloc[-1])
     ma50 = float(close.rolling(50).mean().iloc[-1])
     high10 = float(high.iloc[-10:-1].max())
@@ -309,7 +352,19 @@ def score_stock(symbol, df):
 
     change1 = (last - prev) / prev * 100
     change5 = (last - float(close.iloc[-6])) / float(close.iloc[-6]) * 100
+    green_days = count_green_days(close)
+    market_mode = market_regime()
 
+    chase_status, chase_warnings, extension_ma10, extension_ma20 = anti_chase_status(
+        last=last,
+        ma10=ma10,
+        ma20=ma20,
+        rsi=rsi,
+        change5=change5,
+        green_days=green_days,
+        market_mode=market_mode
+    )
+    
     obv = calc_obv(close, vol)
     obv20 = float(obv.iloc[-1] - obv.iloc[-21])
     obv50 = float(obv.iloc[-1] - obv.iloc[-51])
@@ -384,6 +439,15 @@ def score_stock(symbol, df):
 
     if last < 3:
         score -= 15
+    if chase_status == "禁追":
+        score -= 25
+        reasons.append("高位禁追")
+    elif chase_status == "等回踩":
+        score -= 12
+        reasons.append("等回踩更安全")
+    elif chase_status == "观察":
+        score -= 5
+        reasons.append("轻微过热")    
 
     breakout_prob = min(95, max(20, round(score * 0.7 + money_score * 0.3, 1)))
 
@@ -429,6 +493,12 @@ def score_stock(symbol, df):
         "launch_time": launch_time,
         "absorb_ratio": round(absorb_ratio, 2),
         "reasons": reasons[:5],
+        "market_mode": market_mode,
+        "chase_status": chase_status,
+        "chase_warnings": chase_warnings,
+        "green_days": green_days,
+        "extension_ma10": extension_ma10,
+        "extension_ma20": extension_ma20,
         "risk": risk
     }
 
@@ -651,18 +721,45 @@ def market_regime():
     q_ma20 = float(q.rolling(20).mean().iloc[-1])
     s_ma20 = float(s.rolling(20).mean().iloc[-1])
 
+    q_rsi = float(calc_rsi(q).iloc[-1])
+    s_rsi = float(calc_rsi(s).iloc[-1])
+
+    q_change5 = (q_last - float(q.iloc[-6])) / float(q.iloc[-6]) * 100
+    s_change5 = (s_last - float(s.iloc[-6])) / float(s.iloc[-6]) * 100
+
     bull = 0
+    bear = 0
 
     if q_last > q_ma20:
         bull += 1
+    else:
+        bear += 1
 
     if s_last > s_ma20:
         bull += 1
+    else:
+        bear += 1
 
-    if bull >= 2:
+    if q_change5 > 1:
+        bull += 1
+
+    if s_change5 > 1:
+        bull += 1
+
+    if q_rsi >= 75 or s_rsi >= 75:
+        bear += 1
+
+    if q_change5 < -2 or s_change5 < -2:
+        bear += 1
+
+    if bear >= 3:
+        return "DEFENSIVE"
+
+    if bull >= 3 and q_rsi < 72:
         return "BULLISH"
 
     return "NEUTRAL"
+
 
 
 def build_text(title, arr):
@@ -677,17 +774,36 @@ def build_text(title, arr):
         prob = r.get("breakout_prob", "-")
         launch = r.get("launch_time", "-")
         absorb = r.get("absorb_ratio", "-")
+        chase = r.get("chase_status", "可买")
+        market = r.get("market_mode", "-")
+
+        if chase == "禁追":
+            action_icon = "❌"
+        elif chase == "等回踩":
+            action_icon = "⚠️"
+        elif chase == "观察":
+            action_icon = "👀"
+        else:
+            action_icon = "✅"
 
         lines.append(
-            f"{i}. {r['symbol']} {r['score']}分 "
-            f"| 价 {r['price']} "
-            f"| 买区 {r['buy_low']}-{r['buy_high']} "
-            f"| SL {r['sl']} "
-            f"| TP1 {r['tp1']}"
+            f"{i}. {r['symbol']} {r['score']}分 | {action_icon} {chase}"
         )
+
+        lines.append(
+            f"价 {r['price']} | 买区 {r['buy_low']}-{r['buy_high']} | SL {r['sl']} | TP1 {r['tp1']}"
+        )
+
         lines.append(
             f"主力资金: {money} | 爆发概率: {prob}% | 吸筹强度: {absorb} | {launch}"
         )
+
+        lines.append(
+            f"市场: {market} | RSI {r.get('rsi','-')} | 5日 {r.get('change5','-')}% | 连涨 {r.get('green_days','-')}天"
+        )
+
+        if r.get("chase_warnings"):
+            lines.append("防追高: " + " / ".join(r["chase_warnings"]))
 
         if r.get("reasons"):
             lines.append("逻辑: " + " / ".join(r["reasons"]))
@@ -724,7 +840,7 @@ def run_premarket():
     LAST_PREMARKET_SIGNATURE = sig
     save_state()
 
-    send_telegram(build_text("🚀 V13 盘前 Top5", top))
+    send_telegram(build_text("🚀 V14.1 防追高盘前 Top5", top))
 
     return {"status": "ok", "top": top}
 
@@ -750,7 +866,7 @@ def run_close():
     LAST_CLOSE_SIGNATURE = sig
     save_state()
 
-    send_telegram(build_text("🌙 V13 收盘预备股", top))
+    send_telegram(build_text("🌙 V14.1 防追高收盘预备股", top))
 
     return {"status": "ok", "top": top}
 
@@ -776,7 +892,7 @@ def run_bottom():
     LAST_BOTTOM_SIGNATURE = sig
     save_state()
 
-    send_telegram(build_text("📦 V13 底部吸筹 Top10", top))
+    send_telegram(build_text("📦 V14.1 底部吸筹 Top10", top))
 
     return {"status": "ok", "top": top}
 
@@ -807,7 +923,7 @@ def scheduler_loop():
 
 @app.route("/")
 def home():
-    return "V13 Scanner Running"
+    return "V14.1 Anti Chase Scanner Running"
 
 
 @app.route("/health")
@@ -816,7 +932,7 @@ def health():
         "status": "healthy",
         "time_kl": now_kl_str(),
         "symbols": len(ALL_SYMBOLS),
-        "version": "V13"
+        "version": "V14.1_anti_chase"
     })
 
 
@@ -845,7 +961,7 @@ def route_sectors():
 
 @app.route("/api/test-telegram")
 def route_test():
-    ok = send_telegram("✅ V13 Telegram Test Success")
+    ok = send_telegram("✅ V14.1 Telegram Test Success")
 
     return jsonify({
         "telegram_sent": ok
