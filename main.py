@@ -16,8 +16,8 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 # ============================================================
-# 美股爆发扫描器 V15
-# V14.1 Anti-Chase + 底部吸筹 + 自选股低吸/高位卖出监控
+# 美股爆发扫描器 V16 实盘版
+# V15 Watchlist + 持仓记录 + 盈亏追踪 + 分批止盈 + 强制卖出
 # Railway / Flask / Telegram 可直接部署
 #
 # 新增：
@@ -27,6 +27,9 @@ app = Flask(__name__)
 # 4) 动态加入/移除自选股
 # 5) /run-watchlist 手动扫描自选股
 # 6) 开盘30分钟后 + 收盘后自动扫描自选股
+# 7) /position/add 记录真实持仓
+# 8) 自动计算盈亏、TP1减仓、TP2清仓、SL止损
+# 9) V16强制卖出信号
 # ============================================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -53,6 +56,7 @@ TZ_ET = pytz.timezone("US/Eastern")
 
 STATE_FILE = "scanner_state.json"
 WATCHLIST_FILE = "watchlist.json"
+POSITIONS_FILE = "positions.json"
 
 LAST_PREMARKET_SIGNATURE = ""
 LAST_CLOSE_SIGNATURE = ""
@@ -179,6 +183,125 @@ def save_watchlist():
             json.dump({"my_stocks": MY_STOCKS}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+# ============================================================
+# V16 实盘持仓系统
+# ============================================================
+
+def load_positions():
+    if not os.path.exists(POSITIONS_FILE):
+        return {}
+
+    try:
+        with open(POSITIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            return data
+
+        return {}
+    except Exception:
+        return {}
+
+
+def save_positions(positions):
+    try:
+        with open(POSITIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(positions, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def add_or_update_position(symbol, shares, price, note=""):
+    symbol = clean_symbol(symbol)
+    positions = load_positions()
+
+    positions[symbol] = {
+        "symbol": symbol,
+        "shares": int(shares),
+        "avg_price": float(price),
+        "note": note,
+        "updated_at": now_kl_str()
+    }
+
+    save_positions(positions)
+
+    # 记录持仓时，自动加入自选股
+    load_watchlist()
+    if symbol not in MY_STOCKS and symbol not in BAD_SYMBOLS:
+        MY_STOCKS.append(symbol)
+        MY_STOCKS.sort()
+        save_watchlist()
+
+    return positions[symbol]
+
+
+def remove_position(symbol):
+    symbol = clean_symbol(symbol)
+    positions = load_positions()
+
+    existed = symbol in positions
+    if existed:
+        del positions[symbol]
+        save_positions(positions)
+
+    return existed
+
+
+def calc_position_info(symbol, current_price, suggested_sl=None, tp1=None, tp2=None):
+    positions = load_positions()
+    symbol = clean_symbol(symbol)
+
+    if symbol not in positions:
+        return None
+
+    pos = positions[symbol]
+    shares = int(pos.get("shares", 0))
+    avg_price = float(pos.get("avg_price", pos.get("price", 0)))
+
+    if shares <= 0 or avg_price <= 0:
+        return None
+
+    market_value = current_price * shares
+    cost = avg_price * shares
+    pnl_amount = market_value - cost
+    pnl_pct = pct(current_price, avg_price)
+
+    alerts = []
+    position_action = "持有观察"
+
+    if suggested_sl and current_price <= suggested_sl:
+        alerts.append("🛑 跌破防守SL")
+        position_action = "🔴 必须止损/减仓"
+
+    if tp2 and current_price >= tp2:
+        alerts.append("🚀 到TP2")
+        position_action = "🔴 建议清仓/锁定利润"
+    elif tp1 and current_price >= tp1:
+        alerts.append("🎯 到TP1")
+        position_action = "🟠 建议卖出30%-50%"
+
+    if pnl_pct <= -8:
+        alerts.append("⚠️ 亏损超过8%")
+        position_action = "🔴 检查是否止损"
+    elif pnl_pct >= 15:
+        alerts.append("💰 盈利超过15%")
+        if position_action == "持有观察":
+            position_action = "🟠 可分批止盈"
+
+    return {
+        "shares": shares,
+        "avg_price": round(avg_price, 2),
+        "market_value": round(market_value, 2),
+        "cost": round(cost, 2),
+        "pnl_amount": round(pnl_amount, 2),
+        "pnl_pct": round(pnl_pct, 2),
+        "alerts": alerts,
+        "position_action": position_action,
+        "note": pos.get("note", "")
+    }
 
 
 def load_state():
@@ -632,6 +755,8 @@ def score_stock(symbol, df):
         "tp2": tp2,
         "rsi": round(rsi, 1),
         "vol_ratio": round(vol_ratio, 2),
+        "absorb_ratio": round(absorb_ratio, 2),
+        "force_sell": force_sell,
         "change1": round(change1, 2),
         "change5": round(change5, 2),
         "money_score": money_score,
@@ -836,6 +961,15 @@ def analyze_watch_stock(symbol, df):
     avg_vol20 = float(vol.rolling(20).mean().iloc[-1])
     vol_ratio = float(vol.iloc[-1] / avg_vol20) if avg_vol20 > 0 else 0
 
+    recent_close_for_absorb = close.iloc[-20:]
+    recent_vol_for_absorb = vol.iloc[-20:]
+    prev_close_for_absorb = close.shift(1).iloc[-20:]
+    up_days_for_absorb = recent_close_for_absorb > prev_close_for_absorb
+    down_days_for_absorb = recent_close_for_absorb < prev_close_for_absorb
+    up_vol_for_absorb = float(recent_vol_for_absorb[up_days_for_absorb].sum())
+    down_vol_for_absorb = float(recent_vol_for_absorb[down_days_for_absorb].sum())
+    absorb_ratio = up_vol_for_absorb / down_vol_for_absorb if down_vol_for_absorb > 0 else 1
+
     high20 = float(high.iloc[-20:].max())
     high60 = float(high.iloc[-60:].max())
     low120 = float(low.iloc[-120:].min())
@@ -917,9 +1051,23 @@ def analyze_watch_stock(symbol, df):
         sell_score += 12
         sell_reasons.append("跌破MA5短线转弱")
 
+    force_sell = (
+        rsi >= 75
+        and dist_ma20 >= 12
+        and green_days >= 4
+        and absorb_ratio < 1.1
+    )
+
+    if force_sell:
+        sell_score = max(sell_score, 88)
+        sell_reasons.append("V16强制卖出条件")
+
     sell_score = max(0, min(100, round(sell_score, 1)))
 
-    if sell_score >= 80:
+    if force_sell:
+        sell_action = "🔥 强制卖出 / 高位派发"
+        sell_level = "V16强制卖出"
+    elif sell_score >= 80:
         sell_action = "🔴 全部卖出 / 锁定利润"
         sell_level = "高危派发"
     elif sell_score >= 60:
@@ -1028,6 +1176,8 @@ def analyze_watch_stock(symbol, df):
         "sell_reasons": sell_reasons[:6],
         "rsi": round(rsi, 1),
         "vol_ratio": round(vol_ratio, 2),
+        "absorb_ratio": round(absorb_ratio, 2),
+        "force_sell": force_sell,
         "change1": round(change1, 2),
         "change5": round(change5, 2),
         "change20": round(change20, 2),
@@ -1115,6 +1265,26 @@ def scan_watchlist():
         r = analyze_watch_stock(symbol, df)
 
         if r:
+            position = calc_position_info(
+                symbol,
+                r["price"],
+                suggested_sl=r.get("suggested_sl"),
+                tp1=r.get("tp1"),
+                tp2=r.get("tp2")
+            )
+            r["position"] = position
+
+            if position:
+                if any("TP2" in x for x in position.get("alerts", [])):
+                    r["signal_type"] = "SELL"
+                    r["final_action"] = "🚀 TP2到达 / 建议清仓"
+                elif any("TP1" in x for x in position.get("alerts", [])) and r.get("signal_type") != "SELL":
+                    r["signal_type"] = "WATCH_SELL"
+                    r["final_action"] = "🎯 TP1到达 / 建议减仓30%-50%"
+                elif any("SL" in x for x in position.get("alerts", [])):
+                    r["signal_type"] = "SELL"
+                    r["final_action"] = "🛑 跌破防守SL / 必须处理"
+
             results.append(r)
 
         time.sleep(0.2)
@@ -1196,7 +1366,17 @@ def build_watchlist_text(title, arr):
     for i, r in enumerate(arr, start=1):
         lines.append(f"{i}. {r['symbol']} | {r['final_action']}")
         lines.append(f"价 {r['price']} | 买分 {r['buy_score']}({r['buy_level']}) | 卖分 {r['sell_score']}({r['sell_level']})")
-        lines.append(f"RSI {r['rsi']} | 量比 {r['vol_ratio']} | 5日 {r['change5']}% | 离MA20 {r['dist_ma20']}%")
+
+        position = r.get("position")
+        if position:
+            pnl_icon = "🟢" if position["pnl_pct"] >= 0 else "🔴"
+            lines.append(
+                f"持仓 {position['shares']}股 | 成本 {position['avg_price']} | 市值 ${position['market_value']} | {pnl_icon}盈亏 {position['pnl_pct']}% / ${position['pnl_amount']}"
+            )
+            if position.get("alerts"):
+                lines.append("实盘提醒: " + " / ".join(position["alerts"]))
+
+        lines.append(f"RSI {r['rsi']} | 量比 {r['vol_ratio']} | 吸筹 {r.get('absorb_ratio', '-')} | 5日 {r['change5']}% | 离MA20 {r['dist_ma20']}%")
         lines.append(f"低吸区 {r['buy_low']}-{r['buy_high']} | 防守SL {r['suggested_sl']} | 移动止盈 {r['trail_sl']}")
         lines.append(f"TP1 {r['tp1']} | TP2 {r['tp2']}")
 
@@ -1238,7 +1418,7 @@ def run_premarket():
     LAST_PREMARKET_SIGNATURE = sig
     save_state()
 
-    send_telegram(build_text("🚀 V15 防追高盘前 Top5", top))
+    send_telegram(build_text("🚀 V16 防追高盘前 Top5", top))
 
     return {"status": "ok", "top": top}
 
@@ -1263,7 +1443,7 @@ def run_close():
     LAST_CLOSE_SIGNATURE = sig
     save_state()
 
-    send_telegram(build_text("🌙 V15 防追高收盘预备股", top))
+    send_telegram(build_text("🌙 V16 防追高收盘预备股", top))
 
     return {"status": "ok", "top": top}
 
@@ -1288,7 +1468,7 @@ def run_bottom():
     LAST_BOTTOM_SIGNATURE = sig
     save_state()
 
-    send_telegram(build_text("📦 V15 底部吸筹 Top10", top))
+    send_telegram(build_text("📦 V16 底部吸筹 Top10", top))
 
     return {"status": "ok", "top": top}
 
@@ -1317,7 +1497,7 @@ def run_watchlist(force=False):
     if force or (sig and sig != LAST_WATCHLIST_SIGNATURE):
         LAST_WATCHLIST_SIGNATURE = sig
         save_state()
-        send_telegram(build_watchlist_text("📊 V15 自选股买卖监控", results))
+        send_telegram(build_watchlist_text("📊 V16 实盘自选股买卖监控", results))
         return {"status": "ok", "results": results}
 
     return {"status": "same_or_no_signal", "results": results}
@@ -1364,7 +1544,7 @@ def scheduler_loop():
 
 @app.route("/")
 def home():
-    return "V15 Anti Chase + Bottom + Watchlist Buy/Sell Scanner Running"
+    return "V16 Live Trading Monitor Running"
 
 
 @app.route("/health")
@@ -1375,7 +1555,8 @@ def health():
         "time_kl": now_kl_str(),
         "symbols": len(ALL_SYMBOLS),
         "my_stocks": MY_STOCKS,
-        "version": "V15_watchlist_buy_sell"
+        "positions_count": len(load_positions()),
+        "version": "V16_live_watchlist_positions"
     })
 
 
@@ -1473,6 +1654,75 @@ def route_watchlist_set():
     })
 
 
+@app.route("/positions")
+def route_positions():
+    return jsonify({
+        "count": len(load_positions()),
+        "positions": load_positions(),
+        "usage_add": "/position/add?symbol=NDAQ&shares=50&price=90",
+        "usage_remove": "/position/remove?symbol=NDAQ",
+        "usage_run": "/run-watchlist"
+    })
+
+
+@app.route("/position/add")
+def route_position_add():
+    symbol = clean_symbol(request.args.get("symbol", ""))
+    shares_raw = request.args.get("shares", "")
+    price_raw = request.args.get("price", "")
+    note = request.args.get("note", "")
+
+    if not symbol or not shares_raw or not price_raw:
+        return jsonify({
+            "status": "error",
+            "message": "missing symbol/shares/price",
+            "example": "/position/add?symbol=NDAQ&shares=50&price=90"
+        }), 400
+
+    if symbol in BAD_SYMBOLS:
+        return jsonify({"status": "error", "message": "bad/delisted symbol"}), 400
+
+    try:
+        shares = int(float(shares_raw))
+        price = float(price_raw)
+    except Exception:
+        return jsonify({"status": "error", "message": "shares or price invalid"}), 400
+
+    if shares <= 0 or price <= 0:
+        return jsonify({"status": "error", "message": "shares and price must be > 0"}), 400
+
+    pos = add_or_update_position(symbol, shares, price, note=note)
+
+    return jsonify({
+        "status": "ok",
+        "message": f"{symbol} position saved",
+        "position": pos,
+        "my_stocks": MY_STOCKS
+    })
+
+
+@app.route("/position/remove")
+def route_position_remove():
+    symbol = clean_symbol(request.args.get("symbol", ""))
+
+    if not symbol:
+        return jsonify({"status": "error", "message": "missing symbol"}), 400
+
+    existed = remove_position(symbol)
+
+    return jsonify({
+        "status": "ok",
+        "message": f"{symbol} removed" if existed else f"{symbol} not found",
+        "positions": load_positions()
+    })
+
+
+@app.route("/position/clear")
+def route_position_clear():
+    save_positions({})
+    return jsonify({"status": "ok", "message": "all positions cleared"})
+
+
 @app.route("/sectors")
 def route_sectors():
     return jsonify({
@@ -1484,7 +1734,7 @@ def route_sectors():
 
 @app.route("/api/test-telegram")
 def route_test():
-    ok = send_telegram("✅ V15 Telegram Test Success")
+    ok = send_telegram("✅ V16 Telegram Test Success")
     return jsonify({
         "telegram_sent": ok
     })
