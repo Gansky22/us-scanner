@@ -16,9 +16,14 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 # ============================================================
-# 美股爆发扫描器 V17 提前爆发股扫描版
-# 基于 V16：自选股 + 持仓追踪 + 买卖监控 + 防追高
-# 新增 V17：提前爆发股扫描 / 横盘收窄 / 接近突破位 / 主力吸筹 / 量能温和放大
+# 美股爆发扫描器 V18 主力提前爆发 + 资金流确认版
+# 基于 V17：自选股 + 持仓追踪 + 买卖监控 + 防追高 + 提前爆发扫描
+# V18 新增：
+# 1) 主力慢吸筹评分 accumulation_score
+# 2) 资金流确认 smart_money_flow_score
+# 3) 假突破 / 高位派发扣分 fake_breakout_score
+# 4) A/B级提前爆发分级
+# 5) Telegram 文案升级：主力资金、假突破风险、信号等级
 # Railway / Flask / Telegram 可直接部署
 # ============================================================
 
@@ -348,6 +353,16 @@ def capital_grade(score):
     return "D 弱"
 
 
+def prebreakout_level(score):
+    if score >= 85:
+        return "🔥 A级 主力提前爆发"
+    if score >= 72:
+        return "🟢 B级 准备突破"
+    if score >= 60:
+        return "🟡 C级 观察"
+    return "⚪ 无效"
+
+
 def calc_position_info(symbol, current_price, suggested_sl=None, tp1=None, tp2=None):
     positions = load_positions()
     symbol = clean_symbol(symbol)
@@ -385,6 +400,147 @@ def calc_position_info(symbol, current_price, suggested_sl=None, tp1=None, tp2=N
         "cost": round(cost, 2), "pnl_amount": round(pnl_amount, 2), "pnl_pct": round(pnl_pct, 2),
         "alerts": alerts, "position_action": position_action, "note": pos.get("note", "")
     }
+
+# ============================================================
+# V18 核心新增：主力资金 / 假突破
+# ============================================================
+
+def accumulation_score(df):
+    """V18 主力慢吸筹：低波动 + 温和增量 + OBV稳升。"""
+    if df is None or len(df) < 80:
+        return 0, []
+    close = df["Close"]
+    vol = df["Volume"]
+    score = 0
+    reasons = []
+
+    volatility10 = float(close.pct_change().rolling(10).std().iloc[-1])
+    if volatility10 < 0.025:
+        score += 20
+        reasons.append("低波动控盘")
+    elif volatility10 < 0.04:
+        score += 10
+        reasons.append("波动收窄")
+
+    vol_recent5 = float(vol.iloc[-5:].mean())
+    vol_prev5 = float(vol.iloc[-10:-5].mean())
+    if vol_prev5 > 0 and vol_recent5 > vol_prev5 * 1.08:
+        score += 20
+        reasons.append("成交量温和上升")
+    elif vol_prev5 > 0 and vol_recent5 > vol_prev5:
+        score += 10
+        reasons.append("成交量小幅增加")
+
+    obv = calc_obv(close, vol)
+    obv_ma15 = float(obv.rolling(15).mean().iloc[-1])
+    if float(obv.iloc[-1]) > obv_ma15:
+        score += 20
+        reasons.append("OBV站上15日均值")
+
+    if float(obv.iloc[-1] - obv.iloc[-21]) > 0 and float(close.iloc[-1] - close.iloc[-21]) >= 0:
+        score += 10
+        reasons.append("价量同步改善")
+
+    return max(0, min(70, round(score, 1))), reasons
+
+
+def smart_money_flow_score(df):
+    """V18 资金流确认：上涨日量能 > 下跌日量能，OBV20/60改善。"""
+    if df is None or len(df) < 80:
+        return 0, []
+    close = df["Close"]
+    vol = df["Volume"]
+    score = 0
+    reasons = []
+
+    recent_close = close.iloc[-20:]
+    recent_vol = vol.iloc[-20:]
+    prev_close = close.shift(1).iloc[-20:]
+    up_days = recent_close > prev_close
+    down_days = recent_close < prev_close
+    up_vol = float(recent_vol[up_days].sum())
+    down_vol = float(recent_vol[down_days].sum())
+    absorb_ratio = up_vol / down_vol if down_vol > 0 else 1
+
+    if absorb_ratio >= 1.8:
+        score += 30
+        reasons.append("上涨量明显大于下跌量")
+    elif absorb_ratio >= 1.5:
+        score += 22
+        reasons.append("上涨量大于下跌量")
+    elif absorb_ratio >= 1.2:
+        score += 12
+        reasons.append("疑似吸筹")
+
+    obv = calc_obv(close, vol)
+    if float(obv.iloc[-1] - obv.iloc[-21]) > 0:
+        score += 15
+        reasons.append("OBV20资金流入")
+    if float(obv.iloc[-1] - obv.iloc[-61]) > 0:
+        score += 15
+        reasons.append("OBV60资金流入")
+
+    return max(0, min(60, round(score, 1))), reasons
+
+
+def fake_breakout_score(df):
+    """V18 假突破扣分：上影线、放量不涨、RSI过热、远离MA20。"""
+    if df is None or len(df) < 80:
+        return 0, []
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    open_ = df["Open"]
+    vol = df["Volume"]
+
+    score = 0
+    reasons = []
+    last = float(close.iloc[-1])
+    day_open = float(open_.iloc[-1])
+    day_high = float(high.iloc[-1])
+    day_low = float(low.iloc[-1])
+    day_range = day_high - day_low
+    rsi = float(calc_rsi(close).iloc[-1])
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    avg_vol20 = float(vol.rolling(20).mean().iloc[-1])
+    vol_ratio = float(vol.iloc[-1] / avg_vol20) if avg_vol20 > 0 else 0
+    change1 = pct(last, float(close.iloc[-2]))
+    high20_prev = float(high.iloc[-21:-1].max())
+
+    if day_range > 0:
+        upper_shadow_pct = ((day_high - max(last, day_open)) / day_range) * 100
+        close_position = ((last - day_low) / day_range) * 100
+    else:
+        upper_shadow_pct = 0
+        close_position = 50
+
+    if upper_shadow_pct >= 40 and close_position < 60:
+        score += 25
+        reasons.append("上影线派发")
+    elif upper_shadow_pct >= 30:
+        score += 15
+        reasons.append("上影线偏长")
+
+    if day_high >= high20_prev * 0.995 and close_position < 55:
+        score += 25
+        reasons.append("突破失败/假突破")
+
+    if vol_ratio >= 1.5 and change1 < 0.8:
+        score += 20
+        reasons.append("放量不涨")
+
+    if rsi >= 78:
+        score += 25
+        reasons.append("RSI严重过热")
+    elif rsi >= 75:
+        score += 15
+        reasons.append("RSI过热")
+
+    if pct(last, ma20) >= 12:
+        score += 15
+        reasons.append("远离MA20")
+
+    return max(0, min(100, round(score, 1))), reasons
 
 # ============================================================
 # 大盘模式
@@ -513,11 +669,11 @@ def score_stock(symbol, df, market_mode=None):
     }
 
 # ============================================================
-# V17 提前爆发股扫描
+# V18 提前爆发股扫描
 # ============================================================
 
 def score_prebreakout(symbol, df):
-    """抓涨5%之前的蓄力股：横盘收窄 + 接近突破 + 主力吸筹 + 不过热。"""
+    """V18：横盘收窄 + 接近突破 + 主力吸筹 + 资金流确认 - 假突破扣分。"""
     if df is None or len(df) < 120:
         return None
     close = df["Close"]; high = df["High"]; low = df["Low"]; vol = df["Volume"]
@@ -556,7 +712,10 @@ def score_prebreakout(symbol, df):
     down_vol = float(recent_vol[down_days].sum())
     absorb_ratio = up_vol / down_vol if down_vol > 0 else 1
     green_days = count_green_days(close)
-    score = 0; reasons = []
+
+    score = 0
+    reasons = []
+
     if last > ma20: score += 15; reasons.append("站上MA20")
     if ma5 > ma10 > ma20: score += 15; reasons.append("短均线多头排列")
     if ma20 >= ma50 * 0.98: score += 10; reasons.append("MA20贴近/站上MA50")
@@ -573,15 +732,27 @@ def score_prebreakout(symbol, df):
     elif 2.2 < vol_ratio <= 3.5: score += 6; reasons.append("量能放大")
     if 50 <= rsi <= 68: score += 12; reasons.append("RSI健康")
     elif 68 < rsi <= 72: score += 4; reasons.append("RSI偏强")
+
+    # 原本防追高扣分
     if rsi >= 75: score -= 25; reasons.append("RSI过热扣分")
     if change5 >= 12: score -= 20; reasons.append("5日涨幅过大扣分")
     if dist_ma20 >= 12: score -= 20; reasons.append("离MA20太远扣分")
     if range20 >= 25: score -= 15; reasons.append("波动过大扣分")
     if change20 >= 35: score -= 15; reasons.append("20日涨幅过大扣分")
     if green_days >= 4: score -= 8; reasons.append("连涨过多扣分")
-    score = max(0, min(100, round(score, 1)))
-    if score < 60:
+
+    # V18 新增主力资金确认
+    acc_score, acc_reasons = accumulation_score(df)
+    smart_score, smart_reasons = smart_money_flow_score(df)
+    fake_score, fake_reasons = fake_breakout_score(df)
+
+    # V18 总分：基础结构 + 主力慢吸筹 + 资金流确认 - 假突破风险
+    v18_score = score + acc_score * 0.45 + smart_score * 0.45 - fake_score * 0.75
+    v18_score = max(0, min(100, round(v18_score, 1)))
+
+    if v18_score < 60:
         return None
+
     atr = calc_atr(df).iloc[-1]
     if pd.isna(atr): atr = last * 0.04
     breakout_price = round(high20_prev, 2)
@@ -591,17 +762,30 @@ def score_prebreakout(symbol, df):
     tp1 = round(last + atr * 2.0, 2)
     tp2 = round(last + atr * 3.5, 2)
     risk = build_risk((buy_low + buy_high) / 2, sl)
-    if score >= 82: launch_time = "1-3天内可能爆发"
-    elif score >= 72: launch_time = "3-5天重点观察"
-    else: launch_time = "等待放量突破"
+
+    if v18_score >= 85:
+        launch_time = "1-3天内可能爆发"
+    elif v18_score >= 72:
+        launch_time = "3-5天重点观察"
+    else:
+        launch_time = "等待放量突破"
+
+    all_reasons = reasons[:7]
+    v18_reasons = (acc_reasons + smart_reasons)[:6]
+    risk_reasons = fake_reasons[:5]
+
     return {
-        "symbol": symbol, "sector": find_sector(symbol), "score": score, "price": round(last, 2),
-        "breakout_price": breakout_price, "buy_low": buy_low, "buy_high": buy_high,
+        "symbol": symbol, "sector": find_sector(symbol), "score": v18_score, "base_score": round(score, 1),
+        "accumulation_score": acc_score, "smart_money_score": smart_score, "fake_score": fake_score,
+        "signal_level": prebreakout_level(v18_score),
+        "price": round(last, 2), "breakout_price": breakout_price,
+        "buy_low": buy_low, "buy_high": buy_high,
         "sl": sl, "tp1": tp1, "tp2": tp2, "rsi": round(rsi, 1), "vol_ratio": round(vol_ratio, 2),
         "absorb_ratio": round(absorb_ratio, 2), "change1": round(change1, 2), "change5": round(change5, 2),
         "change20": round(change20, 2), "dist_ma20": round(dist_ma20, 2), "range20": round(range20, 2),
         "range60": round(range60, 2), "obv20": round(obv20, 2), "obv60": round(obv60, 2),
-        "green_days": green_days, "launch_time": launch_time, "reasons": reasons[:7], "risk": risk
+        "green_days": green_days, "launch_time": launch_time, "reasons": all_reasons,
+        "v18_reasons": v18_reasons, "risk_reasons": risk_reasons, "risk": risk
     }
 
 # ============================================================
@@ -706,9 +890,9 @@ def analyze_watch_stock(symbol, df):
     if last < ma5 and rsi >= 65: sell_score += 12; sell_reasons.append("跌破MA5短线转弱")
     force_sell = (rsi >= 75 and dist_ma20 >= 12 and green_days >= 4 and absorb_ratio < 1.1)
     if force_sell:
-        sell_score = max(sell_score, 88); sell_reasons.append("V17强制卖出条件")
+        sell_score = max(sell_score, 88); sell_reasons.append("V18强制卖出条件")
     sell_score = max(0, min(100, round(sell_score, 1)))
-    if force_sell: sell_action = "🔥 强制卖出 / 高位派发"; sell_level = "V17强制卖出"
+    if force_sell: sell_action = "🔥 强制卖出 / 高位派发"; sell_level = "V18强制卖出"
     elif sell_score >= 80: sell_action = "🔴 全部卖出 / 锁定利润"; sell_level = "高危派发"
     elif sell_score >= 60: sell_action = "🟠 分批止盈 30%-50%"; sell_level = "明显派发"
     elif sell_score >= 40: sell_action = "🟡 收紧止损 / 不加仓"; sell_level = "轻微过热"
@@ -776,7 +960,7 @@ def scan_prebreakout():
                 except Exception:
                     pass
         time.sleep(BATCH_SLEEP)
-    results.sort(key=lambda x: x["score"], reverse=True)
+    results.sort(key=lambda x: (x["score"], x.get("smart_money_score", 0), -x.get("fake_score", 0)), reverse=True)
     return results
 
 
@@ -849,16 +1033,19 @@ def build_prebreakout_text(title, arr):
         lines.append("暂无提前爆发股")
         return "\n".join(lines)
     for i, r in enumerate(arr, start=1):
-        lines.append(f"{i}. {r['symbol']} | {r['score']}分 | 🚀 {r['launch_time']}")
-        lines.append(f"价 {r['price']} | 突破位 {r['breakout_price']}")
+        lines.append(f"{i}. {r['symbol']} | {r['score']}分 | {r.get('signal_level', prebreakout_level(r['score']))}")
+        lines.append(f"价 {r['price']} | 突破位 {r['breakout_price']} | 🚀 {r['launch_time']}")
         lines.append(f"埋伏区 {r['buy_low']}-{r['buy_high']} | SL {r['sl']} | TP1 {r['tp1']} | TP2 {r['tp2']}")
+        lines.append(f"结构分 {r.get('base_score','-')} | 慢吸筹 {r.get('accumulation_score','-')} | 资金流 {r.get('smart_money_score','-')} | 假突破风险 {r.get('fake_score','-')}")
         lines.append(f"RSI {r['rsi']} | 量比 {r['vol_ratio']} | 吸筹 {r['absorb_ratio']} | 20日振幅 {r['range20']}%")
         lines.append(f"5日 {r['change5']}% | 20日 {r['change20']}% | 离MA20 {r['dist_ma20']}% | 连涨 {r.get('green_days','-')}天")
-        if r.get("reasons"): lines.append("提前逻辑: " + " / ".join(r["reasons"]))
+        if r.get("reasons"): lines.append("结构逻辑: " + " / ".join(r["reasons"]))
+        if r.get("v18_reasons"): lines.append("V18主力逻辑: " + " / ".join(r["v18_reasons"]))
+        if r.get("risk_reasons"): lines.append("风险扣分: " + " / ".join(r["risk_reasons"]))
         risk = r.get("risk")
         if risk: lines.append(f"仓位建议: {risk['shares']}股 | 约${risk['position_value']} | 最大亏损约${risk['max_loss']}")
         lines.append("")
-    lines.append("使用重点：V17名单是埋伏/等突破，不是看到大涨后追高。")
+    lines.append("使用重点：V18名单是提前埋伏/等突破，不是看到大涨后追高。")
     return "\n".join(lines)
 
 
@@ -898,7 +1085,7 @@ def run_premarket():
     sig = "|".join([x["symbol"] for x in top])
     if sig == LAST_PREMARKET_SIGNATURE: return {"status": "same"}
     LAST_PREMARKET_SIGNATURE = sig; save_state()
-    send_telegram(build_text("🚀 V17 防追高盘前 Top5", top))
+    send_telegram(build_text("🚀 V18 防追高盘前 Top5", top))
     return {"status": "ok", "top": top}
 
 
@@ -911,7 +1098,7 @@ def run_close():
     sig = "|".join([x["symbol"] for x in top])
     if sig == LAST_CLOSE_SIGNATURE: return {"status": "same"}
     LAST_CLOSE_SIGNATURE = sig; save_state()
-    send_telegram(build_text("🌙 V17 防追高收盘预备股", top))
+    send_telegram(build_text("🌙 V18 防追高收盘预备股", top))
     return {"status": "ok", "top": top}
 
 
@@ -921,11 +1108,11 @@ def run_prebreakout(force=False):
     results = scan_prebreakout()
     if not results: return {"status": "empty"}
     top = results[:10]
-    sig = "|".join([f"{x['symbol']}:{x['score']}:{x['price']}" for x in top])
+    sig = "|".join([f"{x['symbol']}:{x['score']}:{x['price']}:{x.get('fake_score',0)}" for x in top])
     if (not force) and sig == LAST_PREBREAKOUT_SIGNATURE:
         return {"status": "same", "top": top}
     LAST_PREBREAKOUT_SIGNATURE = sig; save_state()
-    send_telegram(build_prebreakout_text("🚀 V17 提前爆发股 Top10", top))
+    send_telegram(build_prebreakout_text("🚀 V18 主力提前爆发 Top10", top))
     return {"status": "ok", "top": top}
 
 
@@ -938,7 +1125,7 @@ def run_bottom():
     sig = "|".join([x["symbol"] for x in top])
     if sig == LAST_BOTTOM_SIGNATURE: return {"status": "same"}
     LAST_BOTTOM_SIGNATURE = sig; save_state()
-    send_telegram(build_text("📦 V17 底部吸筹 Top10", top))
+    send_telegram(build_text("📦 V18 底部吸筹 Top10", top))
     return {"status": "ok", "top": top}
 
 
@@ -951,7 +1138,7 @@ def run_watchlist(force=False):
     sig = "|".join([f"{x['symbol']}:{x['signal_type']}:{x['sell_score']}:{x['buy_score']}" for x in important])
     if force or (sig and sig != LAST_WATCHLIST_SIGNATURE):
         LAST_WATCHLIST_SIGNATURE = sig; save_state()
-        send_telegram(build_watchlist_text("📊 V17 实盘自选股买卖监控", results))
+        send_telegram(build_watchlist_text("📊 V18 实盘自选股买卖监控", results))
         return {"status": "ok", "results": results}
     return {"status": "same_or_no_signal", "results": results}
 
@@ -982,12 +1169,12 @@ def scheduler_loop():
 
 @app.route("/")
 def home():
-    return "V17 Pre-Breakout Live Trading Monitor Running"
+    return "V18 Smart Money Pre-Breakout Live Trading Monitor Running"
 
 @app.route("/health")
 def health():
     load_watchlist()
-    return jsonify({"status": "healthy", "time_kl": now_kl_str(), "symbols": len(ALL_SYMBOLS), "my_stocks": MY_STOCKS, "positions_count": len(load_positions()), "version": "V17_prebreakout_live"})
+    return jsonify({"status": "healthy", "time_kl": now_kl_str(), "symbols": len(ALL_SYMBOLS), "my_stocks": MY_STOCKS, "positions_count": len(load_positions()), "version": "V18_smart_money_prebreakout_live"})
 
 @app.route("/run-premarket")
 def route_premarket(): return jsonify(run_premarket())
@@ -1077,7 +1264,7 @@ def route_sectors(): return jsonify({"count": len(SECTOR_POOLS), "symbols": len(
 
 @app.route("/api/test-telegram")
 def route_test():
-    ok = send_telegram("✅ V17 Telegram Test Success")
+    ok = send_telegram("✅ V18 Telegram Test Success")
     return jsonify({"telegram_sent": ok})
 
 # ============================================================
@@ -1090,3 +1277,4 @@ if __name__ == "__main__":
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
     app.run(host="0.0.0.0", port=PORT)
+
