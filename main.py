@@ -353,14 +353,61 @@ def capital_grade(score):
     return "D 弱"
 
 
-def prebreakout_level(score):
-    if score >= 85:
-        return "🔥 A级 主力提前爆发"
-    if score >= 72:
-        return "🟢 B级 准备突破"
-    if score >= 60:
-        return "🟡 C级 观察"
-    return "⚪ 无效"
+def prebreakout_level(score, rsi=50, vol_ratio=1, dist_ma20=0, fake_score=0, green_days=0):
+    """
+    V19.1 主力确认等级
+    重点：不是分数高就一定A级，必须通过量能/风险确认
+    """
+
+    # 强制降级规则
+    forced_cap = None
+
+    if rsi >= 78:
+        forced_cap = "C"
+    elif rsi >= 75:
+        forced_cap = "B"
+
+    if dist_ma20 >= 12:
+        forced_cap = "B" if forced_cap is None else forced_cap
+
+    if vol_ratio < 1.0:
+        forced_cap = "B" if forced_cap is None else forced_cap
+
+    if fake_score >= 40:
+        forced_cap = "C"
+
+    if green_days >= 4:
+        forced_cap = "B" if forced_cap is None else forced_cap
+
+    # 原始等级
+    if score >= 90 and vol_ratio >= 1.3 and fake_score < 25 and rsi < 72:
+        level = "S"
+        text = "🔥 S级 真主力进场"
+    elif score >= 82:
+        level = "A"
+        text = "🟢 A级 主力提前吸筹"
+    elif score >= 72:
+        level = "B"
+        text = "👀 B级 等突破确认"
+    elif score >= 62:
+        level = "C"
+        text = "⚠️ C级 高风险观察"
+    else:
+        level = "D"
+        text = "🚫 D级 不碰"
+
+    # 套用强制降级
+    rank = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
+    cap_text = {
+        "B": "👀 B级 等突破确认",
+        "C": "⚠️ C级 高风险观察",
+        "D": "🚫 D级 不碰"
+    }
+
+    if forced_cap and rank[level] > rank[forced_cap]:
+        text = cap_text[forced_cap]
+
+    return text
 
 
 def calc_position_info(symbol, current_price, suggested_sl=None, tp1=None, tp2=None):
@@ -746,9 +793,62 @@ def score_prebreakout(symbol, df):
     smart_score, smart_reasons = smart_money_flow_score(df)
     fake_score, fake_reasons = fake_breakout_score(df)
 
-    # V18 总分：基础结构 + 主力慢吸筹 + 资金流确认 - 假突破风险
-    v18_score = score + acc_score * 0.45 + smart_score * 0.45 - fake_score * 0.75
-    v18_score = max(0, min(100, round(v18_score, 1)))
+    # ========================================================
+    # V19.1 主力确认版：防分数通膨 + RVOL量能确认
+    # ========================================================
+
+    v19_score = (
+        score * 0.55 +
+        acc_score * 0.25 +
+        smart_score * 0.30 -
+        fake_score * 0.90
+    )
+
+    # RVOL 量能加权
+    if vol_ratio >= 2.5:
+        v19_score += 18
+    elif vol_ratio >= 2.0:
+        v19_score += 14
+    elif vol_ratio >= 1.5:
+        v19_score += 9
+    elif vol_ratio >= 1.2:
+        v19_score += 4
+    elif vol_ratio < 1.0:
+        v19_score -= 15
+
+    # 过热扣分
+    if rsi >= 78:
+        v19_score -= 22
+    elif rsi >= 75:
+        v19_score -= 15
+    elif rsi >= 70:
+        v19_score -= 6
+
+    # 离MA20太远扣分
+    if dist_ma20 >= 12:
+        v19_score -= 18
+    elif dist_ma20 >= 9:
+        v19_score -= 8
+
+    # 连涨过多扣分
+    if green_days >= 4:
+        v19_score -= 12
+    elif green_days >= 3:
+        v19_score -= 6
+
+    # 20日涨幅过大扣分
+    if change20 >= 35:
+        v19_score -= 12
+    elif change20 >= 25:
+        v19_score -= 6
+
+    # 假突破风险强扣
+    if fake_score >= 40:
+        v19_score -= 15
+    elif fake_score >= 25:
+        v19_score -= 8
+
+    v18_score = max(0, min(96, round(v19_score, 1)))
 
     if v18_score < 60:
         return None
@@ -777,7 +877,14 @@ def score_prebreakout(symbol, df):
     return {
         "symbol": symbol, "sector": find_sector(symbol), "score": v18_score, "base_score": round(score, 1),
         "accumulation_score": acc_score, "smart_money_score": smart_score, "fake_score": fake_score,
-        "signal_level": prebreakout_level(v18_score),
+        "signal_level": prebreakout_level(
+         v18_score,
+         rsi=round(rsi, 1),
+         vol_ratio=round(vol_ratio, 2),
+         dist_ma20=round(dist_ma20, 2),
+         fake_score=fake_score,
+         green_days=green_days
+        ),
         "price": round(last, 2), "breakout_price": breakout_price,
         "buy_low": buy_low, "buy_high": buy_high,
         "sl": sl, "tp1": tp1, "tp2": tp2, "rsi": round(rsi, 1), "vol_ratio": round(vol_ratio, 2),
@@ -1028,24 +1135,48 @@ def build_text(title, arr):
 
 
 def build_prebreakout_text(title, arr):
-    lines = [title, now_kl_str(), ""]
+    lines = [title.replace("V18", "V19.1"), now_kl_str(), ""]
+
     if not arr:
-        lines.append("暂无提前爆发股")
+        lines.append("暂无主力确认股")
         return "\n".join(lines)
+
     for i, r in enumerate(arr, start=1):
-        lines.append(f"{i}. {r['symbol']} | {r['score']}分 | {r.get('signal_level', prebreakout_level(r['score']))}")
-        lines.append(f"价 {r['price']} | 突破位 {r['breakout_price']} | 🚀 {r['launch_time']}")
-        lines.append(f"埋伏区 {r['buy_low']}-{r['buy_high']} | SL {r['sl']} | TP1 {r['tp1']} | TP2 {r['tp2']}")
-        lines.append(f"结构分 {r.get('base_score','-')} | 慢吸筹 {r.get('accumulation_score','-')} | 资金流 {r.get('smart_money_score','-')} | 假突破风险 {r.get('fake_score','-')}")
-        lines.append(f"RSI {r['rsi']} | 量比 {r['vol_ratio']} | 吸筹 {r['absorb_ratio']} | 20日振幅 {r['range20']}%")
-        lines.append(f"5日 {r['change5']}% | 20日 {r['change20']}% | 离MA20 {r['dist_ma20']}% | 连涨 {r.get('green_days','-')}天")
-        if r.get("reasons"): lines.append("结构逻辑: " + " / ".join(r["reasons"]))
-        if r.get("v18_reasons"): lines.append("V18主力逻辑: " + " / ".join(r["v18_reasons"]))
-        if r.get("risk_reasons"): lines.append("风险扣分: " + " / ".join(r["risk_reasons"]))
-        risk = r.get("risk")
-        if risk: lines.append(f"仓位建议: {risk['shares']}股 | 约${risk['position_value']} | 最大亏损约${risk['max_loss']}")
+        lines.append(f"{i}. {r['symbol']}｜{r['score']}分｜{r.get('signal_level', '-')}")
+        lines.append(f"价：{r['price']}")
+        lines.append(f"突破：{r['breakout_price']}")
+        lines.append(f"埋伏：{r['buy_low']} - {r['buy_high']}")
+        lines.append(f"SL：{r['sl']}")
+        lines.append(f"TP1：{r['tp1']}｜TP2：{r['tp2']}")
         lines.append("")
-    lines.append("使用重点：V18名单是提前埋伏/等突破，不是看到大涨后追高。")
+        lines.append(f"主力确认：慢吸筹 {r.get('accumulation_score','-')}｜资金流 {r.get('smart_money_score','-')}")
+        lines.append(f"风险：假突破 {r.get('fake_score','-')}｜RVOL {r['vol_ratio']}｜RSI {r['rsi']}")
+        lines.append(f"5日：{r['change5']}%｜20日：{r['change20']}%｜离MA20：{r['dist_ma20']}%｜连涨：{r.get('green_days','-')}天")
+        lines.append(f"启动判断：{r['launch_time']}")
+        lines.append("")
+
+        if r.get("reasons"):
+            lines.append("结构：")
+            lines.append(" / ".join(r["reasons"]))
+
+        if r.get("v18_reasons"):
+            lines.append("主力逻辑：")
+            lines.append(" / ".join(r["v18_reasons"]))
+
+        if r.get("risk_reasons"):
+            lines.append("风险提醒：")
+            lines.append(" / ".join(r["risk_reasons"]))
+
+        risk = r.get("risk")
+        if risk:
+            lines.append("")
+            lines.append(f"仓位：{risk['shares']}股｜约${risk['position_value']}｜最大亏损约${risk['max_loss']}")
+
+        lines.append("")
+        lines.append("━━━━━━━━━━━━")
+        lines.append("")
+
+    lines.append("V19.1重点：S级/A级才是主力确认，B级等突破，C级只观察。")
     return "\n".join(lines)
 
 
@@ -1112,7 +1243,7 @@ def run_prebreakout(force=False):
     if (not force) and sig == LAST_PREBREAKOUT_SIGNATURE:
         return {"status": "same", "top": top}
     LAST_PREBREAKOUT_SIGNATURE = sig; save_state()
-    send_telegram(build_prebreakout_text("🚀 V18 主力提前爆发 Top10", top))
+    send_telegram(build_prebreakout_text("🚀 V19.1 主力确认 Top10", top))
     return {"status": "ok", "top": top}
 
 
@@ -1174,7 +1305,7 @@ def home():
 @app.route("/health")
 def health():
     load_watchlist()
-    return jsonify({"status": "healthy", "time_kl": now_kl_str(), "symbols": len(ALL_SYMBOLS), "my_stocks": MY_STOCKS, "positions_count": len(load_positions()), "version": "V18_smart_money_prebreakout_live"})
+    return jsonify({"status": "healthy", "time_kl": now_kl_str(), "symbols": len(ALL_SYMBOLS), "my_stocks": MY_STOCKS, "positions_count": len(load_positions()), "version": "V19.1_smart_money_confirm"})
 
 @app.route("/run-premarket")
 def route_premarket(): return jsonify(run_premarket())
