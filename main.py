@@ -16,7 +16,7 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 # ============================================================
-# 美股爆发扫描器 V18 主力提前爆发 + 资金流确认版
+# 美股爆发扫描器 V20 做T雷达 + 主力提前爆发版
 # 基于 V17：自选股 + 持仓追踪 + 买卖监控 + 防追高 + 提前爆发扫描
 # V18 新增：
 # 1) 主力慢吸筹评分 accumulation_score
@@ -25,6 +25,7 @@ app = Flask(__name__)
 # 4) A/B级提前爆发分级
 # 5) Telegram 文案升级：主力资金、假突破风险、信号等级
 # Railway / Flask / Telegram 可直接部署
+# V20 新增：做T雷达、VWAP、日均振幅、流动性、A/B/C做T分级、低吸/高抛剧本
 # ============================================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -41,7 +42,11 @@ MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.02"))
 MAX_POSITION_RATIO = float(os.getenv("MAX_POSITION_RATIO", "0.30"))
 MAX_LOSS_AMOUNT = ACCOUNT_SIZE * MAX_RISK_PER_TRADE
 
-DEFAULT_MY_STOCKS = os.getenv("MY_STOCKS", "NDAQ,PANW,CRWD,IONQ,LUNR").strip()
+DEFAULT_MY_STOCKS = os.getenv("MY_STOCKS", "APP,AFRM,IONQ,LUNR,PLTR,NVDA,SOUN,TSLA").strip()
+T_RADAR_STOCKS_ENV = os.getenv("T_RADAR_STOCKS", "").strip()
+T_MIN_DOLLAR_VOLUME = float(os.getenv("T_MIN_DOLLAR_VOLUME", "80000000"))
+T_MIN_AVG_RANGE = float(os.getenv("T_MIN_AVG_RANGE", "3.0"))
+T_MAX_STOCKS = int(os.getenv("T_MAX_STOCKS", "15"))
 
 TZ_KL = pytz.timezone("Asia/Kuala_Lumpur")
 TZ_ET = pytz.timezone("US/Eastern")
@@ -56,6 +61,7 @@ LAST_BOTTOM_SIGNATURE = ""
 LAST_WATCHLIST_SIGNATURE = ""
 LAST_PREBREAKOUT_SIGNATURE = ""
 LAST_MARKET_REGIME = ""
+LAST_T_RADAR_SIGNATURE = ""
 INTRADAY_BREAKOUT_SENT = set()
 MY_STOCKS = []
 
@@ -200,7 +206,7 @@ def remove_position(symbol):
 
 def load_state():
     global LAST_PREMARKET_SIGNATURE, LAST_CLOSE_SIGNATURE, LAST_BOTTOM_SIGNATURE
-    global LAST_WATCHLIST_SIGNATURE, LAST_PREBREAKOUT_SIGNATURE, LAST_MARKET_REGIME, INTRADAY_BREAKOUT_SENT
+    global LAST_WATCHLIST_SIGNATURE, LAST_PREBREAKOUT_SIGNATURE, LAST_MARKET_REGIME, LAST_T_RADAR_SIGNATURE, INTRADAY_BREAKOUT_SENT
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -212,6 +218,7 @@ def load_state():
         LAST_WATCHLIST_SIGNATURE = data.get("last_watchlist_signature", "")
         LAST_PREBREAKOUT_SIGNATURE = data.get("last_prebreakout_signature", "")
         LAST_MARKET_REGIME = data.get("last_market_regime", "")
+        LAST_T_RADAR_SIGNATURE = data.get("last_t_radar_signature", "")
         INTRADAY_BREAKOUT_SENT = set(data.get("intraday_breakout_sent", []))
     except Exception:
         pass
@@ -225,6 +232,7 @@ def save_state():
         "last_watchlist_signature": LAST_WATCHLIST_SIGNATURE,
         "last_prebreakout_signature": LAST_PREBREAKOUT_SIGNATURE,
         "last_market_regime": LAST_MARKET_REGIME,
+        "last_t_radar_signature": LAST_T_RADAR_SIGNATURE,
         "intraday_breakout_sent": list(INTRADAY_BREAKOUT_SENT)
     }
     try:
@@ -1113,6 +1121,241 @@ def scan_watchlist():
     results.sort(key=sort_key, reverse=True)
     return results
 
+
+# ============================================================
+# V20 做T雷达：高流量 + 高波动 + VWAP 剧本
+# ============================================================
+
+def get_t_radar_symbols():
+    """做T观察池：优先用 T_RADAR_STOCKS，其次用 MY_STOCKS，最多 T_MAX_STOCKS 支。"""
+    load_watchlist()
+    if T_RADAR_STOCKS_ENV:
+        arr = parse_symbols(T_RADAR_STOCKS_ENV)
+    else:
+        arr = MY_STOCKS[:]
+    arr = [s for s in arr if s and s not in BAD_SYMBOLS]
+    # 做T不建议太多，默认最多 15 支
+    return arr[:max(1, T_MAX_STOCKS)]
+
+
+def calc_vwap_intraday(df):
+    if df is None or df.empty:
+        return None
+    try:
+        typical = (df["High"] + df["Low"] + df["Close"]) / 3
+        pv = typical * df["Volume"]
+        total_vol = df["Volume"].replace(0, math.nan).cumsum()
+        vwap = pv.cumsum() / total_vol
+        last_vwap = float(vwap.dropna().iloc[-1])
+        return round(last_vwap, 2)
+    except Exception:
+        return None
+
+
+def t_level(score):
+    if score >= 78:
+        return "A 做T重点"
+    if score >= 62:
+        return "B 轻仓做T"
+    if score >= 48:
+        return "C 只观察"
+    return "D 不做T"
+
+
+def score_t_stock(symbol, daily_df, intraday_df=None, market_mode="NEUTRAL"):
+    """V20 做T评分：只解决一件事——今天这支票适不适合低吸高抛。"""
+    if daily_df is None or len(daily_df) < 80:
+        return None
+
+    close = daily_df["Close"]
+    high = daily_df["High"]
+    low = daily_df["Low"]
+    vol = daily_df["Volume"]
+
+    last = float(close.iloc[-1])
+    if last < 3:
+        return None
+
+    ma10 = float(close.rolling(10).mean().iloc[-1])
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    ma50 = float(close.rolling(50).mean().iloc[-1])
+    rsi = float(calc_rsi(close).iloc[-1])
+    atr = calc_atr(daily_df).iloc[-1]
+    if pd.isna(atr):
+        atr = last * 0.04
+
+    avg_vol20 = float(vol.rolling(20).mean().iloc[-1])
+    vol_ratio = float(vol.iloc[-1] / avg_vol20) if avg_vol20 > 0 else 0
+    dollar_volume = last * avg_vol20
+    avg_range20 = float(((high - low) / close * 100).rolling(20).mean().iloc[-1])
+    today_range = pct(float(high.iloc[-1]), float(low.iloc[-1]))
+    change5 = pct(last, float(close.iloc[-6]))
+    dist_ma20 = pct(last, ma20)
+
+    obv = calc_obv(close, vol)
+    obv20 = float(obv.iloc[-1] - obv.iloc[-21])
+
+    vwap = calc_vwap_intraday(intraday_df)
+    if vwap:
+        dist_vwap = pct(last, vwap)
+    else:
+        dist_vwap = None
+
+    support_20 = float(low.iloc[-20:].min())
+    resistance_20 = float(high.iloc[-20:].max())
+    support_5 = float(low.iloc[-5:].min())
+    resistance_5 = float(high.iloc[-5:].max())
+
+    support = round(max(support_5, ma20 * 0.985), 2)
+    resistance = round(min(resistance_20, last + atr * 2.0), 2)
+
+    if vwap:
+        dip_low = round(min(vwap, last) - atr * 0.35, 2)
+        dip_high = round(vwap + atr * 0.25, 2)
+    else:
+        dip_low = round(max(support, last - atr * 0.7), 2)
+        dip_high = round(last - atr * 0.2, 2)
+
+    sell_low = round(max(last + atr * 0.8, resistance - atr * 0.35), 2)
+    sell_high = round(max(sell_low, resistance), 2)
+    stop_loss = round(min(support * 0.985, last - atr * 0.9), 2)
+
+    score = 0
+    reasons = []
+    warnings = []
+
+    # 1) 波动：做T的生命线
+    if avg_range20 >= 6:
+        score += 25; reasons.append("高波动")
+    elif avg_range20 >= T_MIN_AVG_RANGE:
+        score += 18; reasons.append("波动足够")
+    elif avg_range20 >= 2:
+        score += 8; reasons.append("波动一般")
+    else:
+        score -= 15; warnings.append("振幅太小")
+
+    # 2) 流动性：避免滑价
+    if dollar_volume >= 500_000_000:
+        score += 22; reasons.append("成交额强")
+    elif dollar_volume >= T_MIN_DOLLAR_VOLUME:
+        score += 16; reasons.append("流动性足够")
+    elif dollar_volume >= 30_000_000:
+        score += 6; warnings.append("流动性一般")
+    else:
+        score -= 20; warnings.append("成交额不足")
+
+    # 3) 趋势过滤：强趋势回踩 > 弱势猜底
+    if last > ma20 and ma20 > ma50:
+        score += 18; reasons.append("主升趋势")
+    elif last > ma20:
+        score += 10; reasons.append("站上MA20")
+    else:
+        score -= 12; warnings.append("仍在MA20下方")
+
+    # 4) VWAP：日内做T关键
+    if dist_vwap is not None:
+        if -1.2 <= dist_vwap <= 2.5:
+            score += 18; reasons.append("贴近VWAP，可做T")
+        elif 2.5 < dist_vwap <= 5:
+            score += 5; warnings.append("离VWAP偏高，等回踩")
+        elif dist_vwap < -1.2:
+            score -= 8; warnings.append("跌破VWAP偏弱")
+        else:
+            score -= 10; warnings.append("远离VWAP，容易追高")
+    else:
+        warnings.append("盘中VWAP暂无数据")
+
+    # 5) 资金/量能
+    if vol_ratio >= 2:
+        score += 14; reasons.append("RVOL强")
+    elif vol_ratio >= 1.3:
+        score += 8; reasons.append("量能增加")
+    elif vol_ratio < 0.8:
+        score -= 8; warnings.append("量能不足")
+
+    if obv20 > 0:
+        score += 8; reasons.append("OBV资金流入")
+
+    # 6) RSI：避免太冷/太热
+    if 40 <= rsi <= 68:
+        score += 10; reasons.append("RSI健康")
+    elif rsi > 75:
+        score -= 18; warnings.append("RSI过热")
+    elif rsi < 32:
+        score -= 10; warnings.append("弱势超跌，不急接")
+
+    # 7) 市场环境
+    if market_mode == "BULLISH":
+        score += 8; reasons.append("大盘顺风")
+    elif market_mode == "DEFENSIVE":
+        score -= 15; warnings.append("大盘防守")
+
+    # 风险强制降级
+    if avg_range20 < T_MIN_AVG_RANGE or dollar_volume < T_MIN_DOLLAR_VOLUME:
+        score = min(score, 58)
+    if last < ma20 and market_mode == "DEFENSIVE":
+        score = min(score, 45)
+    if rsi >= 78:
+        score = min(score, 60)
+
+    score = max(0, min(100, round(score, 1)))
+    level = t_level(score)
+
+    if score >= 78:
+        strategy = "回踩VWAP/支撑不破，可主动做T；拉近高抛区分批卖。"
+    elif score >= 62:
+        strategy = "只做轻仓低吸高抛，不追突破；跌破防守位马上退出。"
+    elif score >= 48:
+        strategy = "先观察，等量能/VWAP/趋势确认后再做。"
+    else:
+        strategy = "不做T，容易越做越亏。"
+
+    return {
+        "symbol": symbol,
+        "sector": find_sector(symbol),
+        "price": round(last, 2),
+        "t_score": score,
+        "t_level": level,
+        "strategy": strategy,
+        "market_mode": market_mode,
+        "avg_range20": round(avg_range20, 2),
+        "today_range": round(today_range, 2),
+        "dollar_volume_m": round(dollar_volume / 1_000_000, 1),
+        "vol_ratio": round(vol_ratio, 2),
+        "vwap": vwap,
+        "dist_vwap": round(dist_vwap, 2) if dist_vwap is not None else None,
+        "rsi": round(rsi, 1),
+        "change5": round(change5, 2),
+        "dist_ma20": round(dist_ma20, 2),
+        "ma20": round(ma20, 2),
+        "support": support,
+        "resistance": resistance,
+        "dip_low": dip_low,
+        "dip_high": dip_high,
+        "sell_low": sell_low,
+        "sell_high": sell_high,
+        "stop_loss": stop_loss,
+        "reasons": reasons[:6],
+        "warnings": warnings[:6],
+    }
+
+
+def scan_t_radar():
+    symbols = get_t_radar_symbols()
+    mode = market_regime()
+    results = []
+    for symbol in symbols:
+        daily = safe_download(symbol, "6mo", "1d")
+        intraday = safe_download(symbol, "5d", "5m")
+        r = score_t_stock(symbol, daily, intraday, market_mode=mode)
+        if r:
+            pos = calc_position_info(symbol, r["price"], suggested_sl=r.get("stop_loss"))
+            r["position"] = pos
+            results.append(r)
+        time.sleep(0.15)
+    results.sort(key=lambda x: (x["t_score"], x["vol_ratio"], x["avg_range20"]), reverse=True)
+    return results
+
 # ============================================================
 # Telegram 文案
 # ============================================================
@@ -1203,6 +1446,38 @@ def build_watchlist_text(title, arr):
     lines.append("移除自选股：/watchlist/remove?symbol=NDAQ")
     return "\n".join(lines)
 
+
+
+def build_t_radar_text(title, arr):
+    lines = [title, now_kl_str(), ""]
+    if not arr:
+        lines.append("暂无做T数据")
+        return "\n".join(lines)
+
+    for i, r in enumerate(arr, start=1):
+        lines.append(f"{i}. {r['symbol']}｜做T分 {r['t_score']}｜{r['t_level']}")
+        lines.append(f"价 {r['price']}｜VWAP {r.get('vwap','-')}｜离VWAP {r.get('dist_vwap','-')}%")
+        lines.append(f"20日均振幅 {r['avg_range20']}%｜今日振幅 {r['today_range']}%｜RVOL {r['vol_ratio']}｜成交额约 ${r['dollar_volume_m']}M")
+        lines.append(f"RSI {r['rsi']}｜5日 {r['change5']}%｜离MA20 {r['dist_ma20']}%｜市场 {r['market_mode']}")
+        lines.append(f"低吸区：{r['dip_low']} - {r['dip_high']}")
+        lines.append(f"高抛区：{r['sell_low']} - {r['sell_high']}")
+        lines.append(f"防守位：{r['stop_loss']}｜支撑 {r['support']}｜压力 {r['resistance']}")
+        lines.append(f"策略：{r['strategy']}")
+        if r.get("position"):
+            p = r["position"]
+            pnl_icon = "🟢" if p["pnl_pct"] >= 0 else "🔴"
+            lines.append(f"持仓：{p['shares']}股｜成本 {p['avg_price']}｜{pnl_icon}盈亏 {p['pnl_pct']}% / ${p['pnl_amount']}")
+        if r.get("reasons"):
+            lines.append("加分：" + " / ".join(r["reasons"]))
+        if r.get("warnings"):
+            lines.append("提醒：" + " / ".join(r["warnings"]))
+        lines.append("")
+        lines.append("━━━━━━━━━━━━")
+        lines.append("")
+
+    lines.append("V20做T规则：A可重点做，B轻仓，C只观察，D不做。只做熟悉观察池，不追陌生妖股。")
+    return "\n".join(lines)
+
 # ============================================================
 # 执行任务
 # ============================================================
@@ -1273,6 +1548,24 @@ def run_watchlist(force=False):
         return {"status": "ok", "results": results}
     return {"status": "same_or_no_signal", "results": results}
 
+
+
+def run_t_radar(force=False):
+    global LAST_T_RADAR_SIGNATURE
+    if is_weekend_et():
+        return {"status": "skip", "watchlist": get_t_radar_symbols()}
+    results = scan_t_radar()
+    if not results:
+        return {"status": "empty", "watchlist": get_t_radar_symbols()}
+    top = results[:10]
+    sig = "|".join([f"{x['symbol']}:{x['t_score']}:{x['price']}:{x.get('vwap','-')}" for x in top])
+    if (not force) and sig == LAST_T_RADAR_SIGNATURE:
+        return {"status": "same", "top": top}
+    LAST_T_RADAR_SIGNATURE = sig
+    save_state()
+    send_telegram(build_t_radar_text("⚡ V20 做T雷达 Top10", top))
+    return {"status": "ok", "top": top, "watchlist": get_t_radar_symbols()}
+
 # ============================================================
 # Scheduler
 # ============================================================
@@ -1283,10 +1576,12 @@ def scheduler_loop():
         d.at("20:45").do(run_prebreakout)
         d.at("21:00").do(run_premarket)
         d.at("22:05").do(run_watchlist)
+        d.at("22:10").do(run_t_radar)
     schedule.every().day.at("04:20").do(run_close)
     schedule.every().day.at("04:35").do(run_bottom)
     schedule.every().day.at("04:40").do(run_prebreakout)
     schedule.every().day.at("04:50").do(run_watchlist)
+    schedule.every().day.at("04:55").do(run_t_radar)
     while True:
         try:
             schedule.run_pending()
@@ -1300,12 +1595,12 @@ def scheduler_loop():
 
 @app.route("/")
 def home():
-    return "V18 Smart Money Pre-Breakout Live Trading Monitor Running"
+    return "V20 T-Radar + Smart Money Pre-Breakout Live Trading Monitor Running"
 
 @app.route("/health")
 def health():
     load_watchlist()
-    return jsonify({"status": "healthy", "time_kl": now_kl_str(), "symbols": len(ALL_SYMBOLS), "my_stocks": MY_STOCKS, "positions_count": len(load_positions()), "version": "V19.1_smart_money_confirm"})
+    return jsonify({"status": "healthy", "time_kl": now_kl_str(), "symbols": len(ALL_SYMBOLS), "my_stocks": MY_STOCKS, "positions_count": len(load_positions()), "version": "V20_t_radar_smart_money_confirm"})
 
 @app.route("/run-premarket")
 def route_premarket(): return jsonify(run_premarket())
@@ -1328,6 +1623,27 @@ def route_prebreakout():
 def route_watchlist_run():
     force = request.args.get("force", "1") == "1"
     return jsonify(run_watchlist(force=force))
+
+
+@app.route("/run-t-radar")
+def route_t_radar_run():
+    force = request.args.get("force", "1") == "1"
+    return jsonify(run_t_radar(force=force))
+
+@app.route("/run-tradar")
+def route_t_radar_alias():
+    force = request.args.get("force", "1") == "1"
+    return jsonify(run_t_radar(force=force))
+
+@app.route("/t-radar")
+def route_t_radar_info():
+    return jsonify({
+        "count": len(get_t_radar_symbols()),
+        "t_radar_stocks": get_t_radar_symbols(),
+        "usage_run": "/run-t-radar",
+        "usage_set_watchlist": "/watchlist/set?symbols=APP,AFRM,IONQ,LUNR,PLTR,NVDA,SOUN,TSLA",
+        "env_optional": "T_RADAR_STOCKS=APP,AFRM,IONQ,LUNR,PLTR,NVDA,SOUN,TSLA"
+    })
 
 @app.route("/watchlist")
 def route_watchlist():
@@ -1395,7 +1711,7 @@ def route_sectors(): return jsonify({"count": len(SECTOR_POOLS), "symbols": len(
 
 @app.route("/api/test-telegram")
 def route_test():
-    ok = send_telegram("✅ V18 Telegram Test Success")
+    ok = send_telegram("✅ V20 T-Radar Telegram Test Success")
     return jsonify({"telegram_sent": ok})
 
 # ============================================================
@@ -1408,4 +1724,3 @@ if __name__ == "__main__":
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
     app.run(host="0.0.0.0", port=PORT)
-
