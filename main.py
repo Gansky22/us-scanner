@@ -16,7 +16,7 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 # ============================================================
-# 美股爆发扫描器 V20 做T雷达 + 主力提前爆发版
+# 美股爆发扫描器 V21 实时做T雷达 + 主力提前爆发版
 # 基于 V17：自选股 + 持仓追踪 + 买卖监控 + 防追高 + 提前爆发扫描
 # V18 新增：
 # 1) 主力慢吸筹评分 accumulation_score
@@ -26,6 +26,7 @@ app = Flask(__name__)
 # 5) Telegram 文案升级：主力资金、假突破风险、信号等级
 # Railway / Flask / Telegram 可直接部署
 # V20 新增：做T雷达、VWAP、日均振幅、流动性、A/B/C做T分级、低吸/高抛剧本
+# V21 新增：双止损、实时VWAP、ORB开盘区间、入场/止损/高抛信号、盘中做T提醒
 # ============================================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -47,6 +48,12 @@ T_RADAR_STOCKS_ENV = os.getenv("T_RADAR_STOCKS", "").strip()
 T_MIN_DOLLAR_VOLUME = float(os.getenv("T_MIN_DOLLAR_VOLUME", "80000000"))
 T_MIN_AVG_RANGE = float(os.getenv("T_MIN_AVG_RANGE", "3.0"))
 T_MAX_STOCKS = int(os.getenv("T_MAX_STOCKS", "15"))
+
+# V21 做T风控参数
+T_DAYTRADE_STOP_PCT = float(os.getenv("T_DAYTRADE_STOP_PCT", "2.5"))   # 日内做T最大容忍亏损%
+T_VWAP_STOP_BUFFER = float(os.getenv("T_VWAP_STOP_BUFFER", "0.8"))     # VWAP下方缓冲%
+T_ORB_MINUTES = int(os.getenv("T_ORB_MINUTES", "30"))                 # 开盘区间分钟数，默认30分钟
+T_ALERT_MIN_SCORE = float(os.getenv("T_ALERT_MIN_SCORE", "62"))       # B级以上才重点提醒
 
 TZ_KL = pytz.timezone("Asia/Kuala_Lumpur")
 TZ_ET = pytz.timezone("US/Eastern")
@@ -1138,16 +1145,65 @@ def get_t_radar_symbols():
     return arr[:max(1, T_MAX_STOCKS)]
 
 
+def _intraday_today_et(df):
+    """取最近一个交易日的5分钟数据，用来计算实时VWAP/ORB。"""
+    if df is None or df.empty:
+        return None
+    try:
+        x = df.copy()
+        if getattr(x.index, "tz", None) is not None:
+            x.index = x.index.tz_convert(TZ_ET)
+        last_day = x.index[-1].date()
+        today = x[x.index.date == last_day]
+        return today if today is not None and not today.empty else x
+    except Exception:
+        return df
+
+
 def calc_vwap_intraday(df):
     if df is None or df.empty:
         return None
     try:
-        typical = (df["High"] + df["Low"] + df["Close"]) / 3
-        pv = typical * df["Volume"]
-        total_vol = df["Volume"].replace(0, math.nan).cumsum()
+        x = _intraday_today_et(df)
+        if x is None or x.empty:
+            return None
+        typical = (x["High"] + x["Low"] + x["Close"]) / 3
+        pv = typical * x["Volume"]
+        total_vol = x["Volume"].replace(0, math.nan).cumsum()
         vwap = pv.cumsum() / total_vol
         last_vwap = float(vwap.dropna().iloc[-1])
         return round(last_vwap, 2)
+    except Exception:
+        return None
+
+
+def calc_orb_levels(df, minutes=None):
+    """V21 ORB：开盘前N分钟高低点。默认30分钟，5m线约6根K。"""
+    if minutes is None:
+        minutes = T_ORB_MINUTES
+    if df is None or df.empty:
+        return None
+    try:
+        x = _intraday_today_et(df)
+        if x is None or x.empty or len(x) < 3:
+            return None
+        bars = max(1, int(minutes / 5))
+        first = x.iloc[:bars]
+        orb_high = float(first["High"].max())
+        orb_low = float(first["Low"].min())
+        last_price = float(x["Close"].iloc[-1])
+        if last_price > orb_high:
+            status = "突破ORB High"
+        elif last_price < orb_low:
+            status = "跌破ORB Low"
+        else:
+            status = "ORB区间内"
+        return {
+            "orb_high": round(orb_high, 2),
+            "orb_low": round(orb_low, 2),
+            "orb_status": status,
+            "bars": len(x),
+        }
     except Exception:
         return None
 
@@ -1163,7 +1219,7 @@ def t_level(score):
 
 
 def score_t_stock(symbol, daily_df, intraday_df=None, market_mode="NEUTRAL"):
-    """V20 做T评分：只解决一件事——今天这支票适不适合低吸高抛。"""
+    """V21 做T评分：高波动 + 高流动 + 实时VWAP + ORB + 双止损。"""
     if daily_df is None or len(daily_df) < 80:
         return None
 
@@ -1172,7 +1228,16 @@ def score_t_stock(symbol, daily_df, intraday_df=None, market_mode="NEUTRAL"):
     low = daily_df["Low"]
     vol = daily_df["Volume"]
 
-    last = float(close.iloc[-1])
+    daily_last = float(close.iloc[-1])
+    current_price = daily_last
+    today_intraday = _intraday_today_et(intraday_df)
+    if today_intraday is not None and not today_intraday.empty:
+        try:
+            current_price = float(today_intraday["Close"].iloc[-1])
+        except Exception:
+            current_price = daily_last
+
+    last = current_price
     if last < 3:
         return None
 
@@ -1188,7 +1253,19 @@ def score_t_stock(symbol, daily_df, intraday_df=None, market_mode="NEUTRAL"):
     vol_ratio = float(vol.iloc[-1] / avg_vol20) if avg_vol20 > 0 else 0
     dollar_volume = last * avg_vol20
     avg_range20 = float(((high - low) / close * 100).rolling(20).mean().iloc[-1])
-    today_range = pct(float(high.iloc[-1]), float(low.iloc[-1]))
+
+    if today_intraday is not None and not today_intraday.empty:
+        today_high = float(today_intraday["High"].max())
+        today_low = float(today_intraday["Low"].min())
+        today_volume = float(today_intraday["Volume"].sum())
+        today_range = pct(today_high, today_low)
+        intraday_rvol = today_volume / avg_vol20 if avg_vol20 > 0 else 0
+    else:
+        today_high = float(high.iloc[-1])
+        today_low = float(low.iloc[-1])
+        today_range = pct(today_high, today_low)
+        intraday_rvol = vol_ratio
+
     change5 = pct(last, float(close.iloc[-6]))
     dist_ma20 = pct(last, ma20)
 
@@ -1196,29 +1273,52 @@ def score_t_stock(symbol, daily_df, intraday_df=None, market_mode="NEUTRAL"):
     obv20 = float(obv.iloc[-1] - obv.iloc[-21])
 
     vwap = calc_vwap_intraday(intraday_df)
-    if vwap:
-        dist_vwap = pct(last, vwap)
-    else:
-        dist_vwap = None
+    dist_vwap = pct(last, vwap) if vwap else None
+    orb = calc_orb_levels(intraday_df)
+    orb_high = orb.get("orb_high") if orb else None
+    orb_low = orb.get("orb_low") if orb else None
+    orb_status = orb.get("orb_status") if orb else "暂无ORB"
 
     support_20 = float(low.iloc[-20:].min())
     resistance_20 = float(high.iloc[-20:].max())
     support_5 = float(low.iloc[-5:].min())
     resistance_5 = float(high.iloc[-5:].max())
 
-    support = round(max(support_5, ma20 * 0.985), 2)
-    resistance = round(min(resistance_20, last + atr * 2.0), 2)
+    support_candidates = [support_5, ma20 * 0.985]
+    if orb_low:
+        support_candidates.append(float(orb_low))
+    support = round(max([x for x in support_candidates if x > 0]), 2)
 
+    resistance_candidates = [resistance_20, last + atr * 2.0]
+    if orb_high:
+        resistance_candidates.append(float(orb_high))
+    resistance = round(min([x for x in resistance_candidates if x > 0]), 2)
+
+    # 做T低吸区：优先围绕VWAP和日内支撑；不是现价追高区
     if vwap:
-        dip_low = round(min(vwap, last) - atr * 0.35, 2)
-        dip_high = round(vwap + atr * 0.25, 2)
+        dip_low = round(max(min(vwap, support) - atr * 0.20, last * 0.94), 2)
+        dip_high = round(max(vwap + atr * 0.15, support), 2)
+        if dip_high > last and dist_vwap is not None and dist_vwap < 1.2:
+            dip_high = round(last * 0.998, 2)
     else:
         dip_low = round(max(support, last - atr * 0.7), 2)
         dip_high = round(last - atr * 0.2, 2)
 
-    sell_low = round(max(last + atr * 0.8, resistance - atr * 0.35), 2)
+    sell_low = round(max(last + atr * 0.65, resistance - atr * 0.35), 2)
     sell_high = round(max(sell_low, resistance), 2)
-    stop_loss = round(min(support * 0.985, last - atr * 0.9), 2)
+
+    # V21 双止损：做T止损近，波段止损远
+    if vwap:
+        vwap_stop = vwap * (1 - T_VWAP_STOP_BUFFER / 100)
+        pct_stop = last * (1 - T_DAYTRADE_STOP_PCT / 100)
+        daytrade_stop = round(max(vwap_stop, pct_stop), 2) if last >= vwap else round(pct_stop, 2)
+    else:
+        daytrade_stop = round(last * (1 - T_DAYTRADE_STOP_PCT / 100), 2)
+    if orb_low and last >= orb_low:
+        daytrade_stop = round(max(daytrade_stop, float(orb_low) * 0.995), 2)
+
+    swing_stop = round(min(support * 0.985, last - atr * 0.9), 2)
+    structure_stop = swing_stop  # 兼容旧字段 stop_loss
 
     score = 0
     reasons = []
@@ -1254,29 +1354,39 @@ def score_t_stock(symbol, daily_df, intraday_df=None, market_mode="NEUTRAL"):
 
     # 4) VWAP：日内做T关键
     if dist_vwap is not None:
-        if -1.2 <= dist_vwap <= 2.5:
-            score += 18; reasons.append("贴近VWAP，可做T")
-        elif 2.5 < dist_vwap <= 5:
-            score += 5; warnings.append("离VWAP偏高，等回踩")
-        elif dist_vwap < -1.2:
-            score -= 8; warnings.append("跌破VWAP偏弱")
+        if -0.8 <= dist_vwap <= 1.5:
+            score += 22; reasons.append("贴近VWAP，容易做T")
+        elif 1.5 < dist_vwap <= 3.5:
+            score += 8; warnings.append("离VWAP偏高，等回踩")
+        elif dist_vwap < -0.8:
+            score -= 12; warnings.append("跌破VWAP偏弱")
         else:
-            score -= 10; warnings.append("远离VWAP，容易追高")
+            score -= 16; warnings.append("远离VWAP，容易追高")
     else:
         warnings.append("盘中VWAP暂无数据")
 
-    # 5) 资金/量能
-    if vol_ratio >= 2:
+    # 5) ORB开盘区间：过滤假启动
+    if orb_high and orb_low:
+        if orb_status == "突破ORB High" and (not vwap or last >= vwap):
+            score += 12; reasons.append("突破ORB High")
+        elif orb_status == "跌破ORB Low":
+            score -= 15; warnings.append("跌破ORB Low")
+        else:
+            reasons.append("ORB区间观察")
+
+    # 6) 资金/量能
+    effective_rvol = max(vol_ratio, intraday_rvol)
+    if effective_rvol >= 2:
         score += 14; reasons.append("RVOL强")
-    elif vol_ratio >= 1.3:
+    elif effective_rvol >= 1.3:
         score += 8; reasons.append("量能增加")
-    elif vol_ratio < 0.8:
+    elif effective_rvol < 0.8:
         score -= 8; warnings.append("量能不足")
 
     if obv20 > 0:
         score += 8; reasons.append("OBV资金流入")
 
-    # 6) RSI：避免太冷/太热
+    # 7) RSI：避免太冷/太热
     if 40 <= rsi <= 68:
         score += 10; reasons.append("RSI健康")
     elif rsi > 75:
@@ -1284,7 +1394,7 @@ def score_t_stock(symbol, daily_df, intraday_df=None, market_mode="NEUTRAL"):
     elif rsi < 32:
         score -= 10; warnings.append("弱势超跌，不急接")
 
-    # 7) 市场环境
+    # 8) 市场环境
     if market_mode == "BULLISH":
         score += 8; reasons.append("大盘顺风")
     elif market_mode == "DEFENSIVE":
@@ -1297,33 +1407,55 @@ def score_t_stock(symbol, daily_df, intraday_df=None, market_mode="NEUTRAL"):
         score = min(score, 45)
     if rsi >= 78:
         score = min(score, 60)
+    if dist_vwap is not None and dist_vwap >= 6:
+        score = min(score, 62)
+    if orb_status == "跌破ORB Low":
+        score = min(score, 48)
 
     score = max(0, min(100, round(score, 1)))
     level = t_level(score)
 
-    if score >= 78:
-        strategy = "回踩VWAP/支撑不破，可主动做T；拉近高抛区分批卖。"
-    elif score >= 62:
-        strategy = "只做轻仓低吸高抛，不追突破；跌破防守位马上退出。"
+    # V21 动作信号
+    if last <= daytrade_stop or orb_status == "跌破ORB Low" or (vwap and last < vwap and effective_rvol >= 1.2):
+        action_signal = "🔴 日内止损/不做T"
+        strategy = "日内结构转弱，先退出或不碰；等重新站回VWAP再评估。"
+    elif score >= 78 and dist_vwap is not None and -0.8 <= dist_vwap <= 1.5 and rsi < 72:
+        action_signal = "🟢 低吸确认"
+        strategy = "贴近VWAP/支撑不破，可主动做T；拉近高抛区分批卖。"
+    elif score >= 62 and dist_vwap is not None and -1.0 <= dist_vwap <= 2.2:
+        action_signal = "🟡 轻仓低吸"
+        strategy = "只做轻仓低吸高抛，不追突破；跌破做T止损马上退出。"
+    elif last >= sell_low or (dist_vwap is not None and dist_vwap >= 3.5):
+        action_signal = "🟠 接近高抛/等回踩"
+        strategy = "价格已偏离VWAP，适合分批卖或等回踩，不适合追。"
     elif score >= 48:
+        action_signal = "👀 等确认"
         strategy = "先观察，等量能/VWAP/趋势确认后再做。"
     else:
+        action_signal = "⚪ 不做T"
         strategy = "不做T，容易越做越亏。"
 
     return {
         "symbol": symbol,
         "sector": find_sector(symbol),
         "price": round(last, 2),
+        "daily_last": round(daily_last, 2),
         "t_score": score,
         "t_level": level,
+        "action_signal": action_signal,
         "strategy": strategy,
         "market_mode": market_mode,
         "avg_range20": round(avg_range20, 2),
         "today_range": round(today_range, 2),
         "dollar_volume_m": round(dollar_volume / 1_000_000, 1),
         "vol_ratio": round(vol_ratio, 2),
+        "intraday_rvol": round(intraday_rvol, 2),
+        "effective_rvol": round(effective_rvol, 2),
         "vwap": vwap,
         "dist_vwap": round(dist_vwap, 2) if dist_vwap is not None else None,
+        "orb_high": orb_high,
+        "orb_low": orb_low,
+        "orb_status": orb_status,
         "rsi": round(rsi, 1),
         "change5": round(change5, 2),
         "dist_ma20": round(dist_ma20, 2),
@@ -1334,11 +1466,12 @@ def score_t_stock(symbol, daily_df, intraday_df=None, market_mode="NEUTRAL"):
         "dip_high": dip_high,
         "sell_low": sell_low,
         "sell_high": sell_high,
-        "stop_loss": stop_loss,
-        "reasons": reasons[:6],
-        "warnings": warnings[:6],
+        "daytrade_stop": daytrade_stop,
+        "swing_stop": swing_stop,
+        "stop_loss": structure_stop,
+        "reasons": reasons[:7],
+        "warnings": warnings[:7],
     }
-
 
 def scan_t_radar():
     symbols = get_t_radar_symbols()
@@ -1349,7 +1482,7 @@ def scan_t_radar():
         intraday = safe_download(symbol, "5d", "5m")
         r = score_t_stock(symbol, daily, intraday, market_mode=mode)
         if r:
-            pos = calc_position_info(symbol, r["price"], suggested_sl=r.get("stop_loss"))
+            pos = calc_position_info(symbol, r["price"], suggested_sl=r.get("daytrade_stop"), tp1=r.get("sell_low"), tp2=r.get("sell_high"))
             r["position"] = pos
             results.append(r)
         time.sleep(0.15)
@@ -1449,24 +1582,28 @@ def build_watchlist_text(title, arr):
 
 
 def build_t_radar_text(title, arr):
-    lines = [title, now_kl_str(), ""]
+    lines = [title.replace("V20", "V21"), now_kl_str(), ""]
     if not arr:
         lines.append("暂无做T数据")
         return "\n".join(lines)
 
     for i, r in enumerate(arr, start=1):
-        lines.append(f"{i}. {r['symbol']}｜做T分 {r['t_score']}｜{r['t_level']}")
+        lines.append(f"{i}. {r['symbol']}｜做T分 {r['t_score']}｜{r['t_level']}｜{r.get('action_signal','-')}")
         lines.append(f"价 {r['price']}｜VWAP {r.get('vwap','-')}｜离VWAP {r.get('dist_vwap','-')}%")
-        lines.append(f"20日均振幅 {r['avg_range20']}%｜今日振幅 {r['today_range']}%｜RVOL {r['vol_ratio']}｜成交额约 ${r['dollar_volume_m']}M")
+        lines.append(f"ORB：{r.get('orb_status','-')}｜高 {r.get('orb_high','-')}｜低 {r.get('orb_low','-')}")
+        lines.append(f"20日均振幅 {r['avg_range20']}%｜今日振幅 {r['today_range']}%｜RVOL {r.get('effective_rvol', r['vol_ratio'])}｜成交额约 ${r['dollar_volume_m']}M")
         lines.append(f"RSI {r['rsi']}｜5日 {r['change5']}%｜离MA20 {r['dist_ma20']}%｜市场 {r['market_mode']}")
         lines.append(f"低吸区：{r['dip_low']} - {r['dip_high']}")
         lines.append(f"高抛区：{r['sell_low']} - {r['sell_high']}")
-        lines.append(f"防守位：{r['stop_loss']}｜支撑 {r['support']}｜压力 {r['resistance']}")
+        lines.append(f"做T止损：{r.get('daytrade_stop','-')}｜波段止损：{r.get('swing_stop','-')}")
+        lines.append(f"支撑 {r['support']}｜压力 {r['resistance']}")
         lines.append(f"策略：{r['strategy']}")
         if r.get("position"):
             p = r["position"]
             pnl_icon = "🟢" if p["pnl_pct"] >= 0 else "🔴"
             lines.append(f"持仓：{p['shares']}股｜成本 {p['avg_price']}｜{pnl_icon}盈亏 {p['pnl_pct']}% / ${p['pnl_amount']}")
+            if p.get("alerts"):
+                lines.append("持仓提醒：" + " / ".join(p["alerts"]))
         if r.get("reasons"):
             lines.append("加分：" + " / ".join(r["reasons"]))
         if r.get("warnings"):
@@ -1475,8 +1612,9 @@ def build_t_radar_text(title, arr):
         lines.append("━━━━━━━━━━━━")
         lines.append("")
 
-    lines.append("V20做T规则：A可重点做，B轻仓，C只观察，D不做。只做熟悉观察池，不追陌生妖股。")
+    lines.append("V21做T规则：A可重点做，B轻仓，C只观察，D不做。做T止损是日内纪律，波段止损是趋势底线。")
     return "\n".join(lines)
+
 
 # ============================================================
 # 执行任务
@@ -1563,7 +1701,7 @@ def run_t_radar(force=False):
         return {"status": "same", "top": top}
     LAST_T_RADAR_SIGNATURE = sig
     save_state()
-    send_telegram(build_t_radar_text("⚡ V20 做T雷达 Top10", top))
+    send_telegram(build_t_radar_text("⚡ V21 实时做T雷达 Top10", top))
     return {"status": "ok", "top": top, "watchlist": get_t_radar_symbols()}
 
 # ============================================================
@@ -1595,12 +1733,12 @@ def scheduler_loop():
 
 @app.route("/")
 def home():
-    return "V20 T-Radar + Smart Money Pre-Breakout Live Trading Monitor Running"
+    return "V21 Real-Time T-Radar + Smart Money Pre-Breakout Live Trading Monitor Running"
 
 @app.route("/health")
 def health():
     load_watchlist()
-    return jsonify({"status": "healthy", "time_kl": now_kl_str(), "symbols": len(ALL_SYMBOLS), "my_stocks": MY_STOCKS, "positions_count": len(load_positions()), "version": "V20_t_radar_smart_money_confirm"})
+    return jsonify({"status": "healthy", "time_kl": now_kl_str(), "symbols": len(ALL_SYMBOLS), "my_stocks": MY_STOCKS, "positions_count": len(load_positions()), "version": "V21_realtime_t_radar_dual_stop_orb"})
 
 @app.route("/run-premarket")
 def route_premarket(): return jsonify(run_premarket())
@@ -1635,12 +1773,18 @@ def route_t_radar_alias():
     force = request.args.get("force", "1") == "1"
     return jsonify(run_t_radar(force=force))
 
+@app.route("/run-t-live")
+def route_t_live_alias():
+    force = request.args.get("force", "1") == "1"
+    return jsonify(run_t_radar(force=force))
+
 @app.route("/t-radar")
 def route_t_radar_info():
     return jsonify({
         "count": len(get_t_radar_symbols()),
         "t_radar_stocks": get_t_radar_symbols(),
         "usage_run": "/run-t-radar",
+        "usage_live": "/run-t-live",
         "usage_set_watchlist": "/watchlist/set?symbols=APP,AFRM,IONQ,LUNR,PLTR,NVDA,SOUN,TSLA",
         "env_optional": "T_RADAR_STOCKS=APP,AFRM,IONQ,LUNR,PLTR,NVDA,SOUN,TSLA"
     })
@@ -1711,7 +1855,7 @@ def route_sectors(): return jsonify({"count": len(SECTOR_POOLS), "symbols": len(
 
 @app.route("/api/test-telegram")
 def route_test():
-    ok = send_telegram("✅ V20 T-Radar Telegram Test Success")
+    ok = send_telegram("✅ V21 Real-Time T-Radar Telegram Test Success")
     return jsonify({"telegram_sent": ok})
 
 # ============================================================
