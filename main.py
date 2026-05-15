@@ -46,7 +46,7 @@ MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.02"))
 MAX_POSITION_RATIO = float(os.getenv("MAX_POSITION_RATIO", "0.30"))
 MAX_LOSS_AMOUNT = ACCOUNT_SIZE * MAX_RISK_PER_TRADE
 
-DEFAULT_MY_STOCKS = os.getenv("MY_STOCKS", "APP,AFRM,IONQ,LUNR,PLTR,NVDA,SOUN,TSLA").strip()
+DEFAULT_MY_STOCKS = os.getenv("MY_STOCKS", "IONQ,APP,AFRM,PLTR,NVDA,TSLA,AMD,META,AMZN,CRM,SOUN,LUNR,SMCI,SOFI,TEM").strip()
 T_RADAR_STOCKS_ENV = os.getenv("T_RADAR_STOCKS", "").strip()
 T_MIN_DOLLAR_VOLUME = float(os.getenv("T_MIN_DOLLAR_VOLUME", "80000000"))
 T_MIN_AVG_RANGE = float(os.getenv("T_MIN_AVG_RANGE", "3.0"))
@@ -2244,6 +2244,59 @@ def route_position_remove():
     existed = remove_position(symbol)
     return jsonify({"status": "ok", "message": f"{symbol} removed" if existed else f"{symbol} not found", "positions": load_positions()})
 
+@app.route("/b/<symbol>/<price>/<qty>")
+@app.route("/b/<symbol>/<price>/<qty>/<setup>")
+def quick_buy(symbol, price, qty, setup="manual"):
+
+    trade = {
+        "symbol": symbol.upper(),
+        "side": "BUY",
+        "price": float(price),
+        "qty": int(qty),
+        "setup": setup,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    trades.append(trade)
+
+    msg = (
+        f"🟢 买入记录\n"
+        f"{symbol.upper()} | {qty}股 @ ${price}\n"
+        f"Setup: {setup}"
+    )
+
+    send_telegram(msg)
+
+    return jsonify({
+        "ok": True,
+        "trade": trade
+    })
+
+@app.route("/s/<symbol>/<price>/<qty>")
+def quick_sell(symbol, price, qty):
+
+    trade = {
+        "symbol": symbol.upper(),
+        "side": "SELL",
+        "price": float(price),
+        "qty": int(qty),
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    trades.append(trade)
+
+    msg = (
+        f"🔴 卖出记录\n"
+        f"{symbol.upper()} | {qty}股 @ ${price}"
+    )
+
+    send_telegram(msg)
+
+    return jsonify({
+        "ok": True,
+        "trade": trade
+    })
+ 
 @app.route("/position/clear")
 def route_position_clear():
     save_positions({})
