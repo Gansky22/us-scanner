@@ -1,144 +1,365 @@
-# 美股爆发扫描器 V7 部署包
+# 美股职业做T扫描器 V23.1
 
-这个包已经包含：
-- 200 支美股扫描池
-- V7 评分：突破 + 放量 + 吸筹 + 主力资金 + 新闻 + 盘前确认
-- Telegram 推送
-- Web API：`/`, `/api/health`, `/run-scan`, `/run-scan-local`
-- Railway 可部署
-- 可选内置定时扫描（默认关闭）
+职业级 VWAP / ORB / Hot Pool 做T系统
 
-## 1) 部署到 Railway
+适用于：
 
-把这整个文件夹上传到 GitHub，然后在 Railway：
-1. New Project
-2. Deploy from GitHub Repo
-3. 选你的 repo
-4. 等自动 build
+* Railway
+* Flask
+* Telegram Bot
+* 美股做T / 日内交易 / 波段观察
 
-Railway 官方文档说明，可以直接从 GitHub 部署 Python/Flask 服务；Cron 也可在服务设置里配置 crontab 表达式。citeturn669746search9turn669746search0
+---
 
-## 2) 必填 Variables
+# V23.1 核心功能
 
-在 Railway 的 Variables 里加入：
+## 1. 专业做T雷达 `/run-t-radar`
 
-```bash
+系统自动筛选：
+
+* VWAP
+* ORB
+* RVOL
+* 振幅
+* OBV资金流
+* 趋势结构
+* Gap风险
+* 财报风险
+
+输出：
+
+* 做T分数
+* A/B/C级
+* 做T策略
+* 做T止损
+* 波段止损
+* 低吸区
+* 高抛区
+
+---
+
+## 2. 实时做T确认 `/run-t-live`
+
+实时监控：
+
+* VWAP回踩
+* ORB突破
+* ORB失败
+* 放量启动
+* 假突破
+* 趋势确认
+
+适合：
+
+* 开盘后
+* 盘中做T
+* 低吸确认
+* 突破确认
+
+---
+
+## 3. 今日热点池 `/run-hot-pool`
+
+自动发现：
+
+* AI热点
+* 爆量股
+* 新闻股
+* 财报股
+* 高波动股
+
+热点条件：
+
+* RVOL
+* 日振幅
+* 成交额
+* 波动性
+
+V23.1 已升级：
+
+* 不再发送“暂无热点”刷屏
+* 防重复发送
+* 冷却锁保护
+
+---
+
+# 做T等级说明
+
+## A级
+
+重点做T。
+
+必须满足：
+
+* VWAP健康
+* ORB突破
+* RVOL强
+* 趋势强
+* 没有重大事件风险
+
+---
+
+## B级
+
+轻仓做T。
+
+代表：
+
+* 条件不错
+* 但未完全确认
+* 或量能不足
+
+---
+
+## C级
+
+只观察。
+
+代表：
+
+* VWAP未确认
+* ORB未突破
+* RVOL太低
+* Gap风险
+* 财报风险
+
+---
+
+# 推荐观察池
+
+## A级核心观察池
+
+```python
+CORE_STOCKS = [
+    "IONQ",
+    "APP",
+    "AFRM",
+    "PLTR",
+    "NVDA",
+    "TSLA",
+    "AMD",
+    "META",
+    "AMZN",
+    "CRM",
+]
+```
+
+---
+
+## B级热点观察池
+
+```python
+HOT_STOCKS = [
+    "SOUN",
+    "LUNR",
+    "SMCI",
+    "SOFI",
+    "TEM",
+]
+```
+
+---
+
+# 职业做T时间参数
+
+## Hot Pool
+
+市场热点扫描：
+
+```python
+schedule.every().day.at("20:20").do(run_hot_pool)
+schedule.every().day.at("00:00").do(run_hot_pool)
+schedule.every().day.at("03:10").do(run_hot_pool)
+```
+
+---
+
+## T Radar
+
+主扫描：
+
+```python
+schedule.every().day.at("20:50").do(run_t_radar)
+schedule.every().day.at("22:00").do(run_t_radar)
+schedule.every().day.at("03:00").do(run_t_radar)
+```
+
+---
+
+## T Live
+
+实时确认：
+
+```python
+schedule.every().day.at("22:15").do(run_t_live)
+schedule.every().day.at("23:00").do(run_t_live)
+schedule.every().day.at("01:00").do(run_t_live)
+```
+
+---
+
+# 防重复发送锁（V23.1）
+
+已加入：
+
+* Hot Pool 冷却锁
+* T Radar 冷却锁
+* T Live 冷却锁
+
+避免：
+
+* Telegram刷屏
+* Railway重复执行
+* 浏览器重复触发
+
+---
+
+# 环境变量
+
+```env
 TELEGRAM_BOT_TOKEN=你的bot token
 TELEGRAM_CHAT_ID=你的chat id
-ENABLE_TELEGRAM=true
-TIMEZONE=Asia/Kuala_Lumpur
+PORT=5000
+
+MAX_WORKERS=20
+BATCH_SIZE=50
+BATCH_SLEEP=1.2
+
+ACCOUNT_SIZE=5000
+MAX_RISK_PER_TRADE=0.02
+MAX_POSITION_RATIO=0.30
 ```
 
-## 3) 建议再加的 Variables
+---
+
+# 做T风控参数
+
+```python
+T_A_MIN_RVOL = 1.5
+T_B_MIN_RVOL = 0.9
+T_NO_TRADE_RVOL = 0.6
+T_NO_CHASE_DIST_VWAP = 3.0
+```
+
+---
+
+# 简短交易记录系统
+
+## 买入
+
+```text
+/b/IONQ/54.2/20/vwap
+```
+
+---
+
+## 卖出
+
+```text
+/s/IONQ/57.1/20
+```
+
+---
+
+# Setup分类
+
+| Setup    | 意思     |
+| -------- | ------ |
+| vwap     | VWAP回踩 |
+| orb      | ORB突破  |
+| dip      | 低吸     |
+| breakout | 突破     |
+| swing    | 波段     |
+| scalp    | 超短     |
+| news     | 新闻     |
+| earn     | 财报     |
+
+---
+
+# Railway 部署
+
+## Start Command
 
 ```bash
-INTERNAL_SCAN_TOKEN=你自定义一个密钥
-ENABLE_INTERNAL_SCHEDULER=false
-MAX_WORKERS=10
-PREMARKET_TOP_CANDIDATES=25
-NEWS_TOP_CANDIDATES=40
+python main.py
 ```
 
-说明：
-- `INTERNAL_SCAN_TOKEN`：保护 `/run-scan`
-- `ENABLE_INTERNAL_SCHEDULER=false`：默认先关闭，避免你刚部署时重复跑
+---
 
-## 4) 测试网址
+## requirements.txt
 
-部署后打开：
+必须包含：
 
-```bash
-https://你的域名/
-https://你的域名/api/health
-https://你的域名/run-scan?token=你的密钥
-https://你的域名/run-scan-local
+```text
+flask
+pandas
+numpy
+yfinance
+requests
+schedule
+pytz
 ```
 
-- `/`：服务在线状态
-- `/api/health`：健康检查
-- `/run-scan`：立即扫描并发 Telegram
-- `/run-scan-local`：立即扫描，但只在网页显示，不发 Telegram
+---
 
-## 5) 定时扫描两种方式
+# 推荐使用流程
 
-### 方式 A：用 Railway Cron（更稳）
-Railway 文档说明可以在服务的 Settings 里填写 Cron Schedule。citeturn669746search0
+## 20:20
 
-这个包本身是 Web Service，所以更简单的做法是：
-- 继续保留 web service 常驻
-- 用外部定时器或第二个 cron service 去请求 `/run-scan?token=你的密钥`
+/run-hot-pool
 
-### 方式 B：开启内置定时器（比较省事）
-Variables 设成：
+查看今日热点。
 
-```bash
-ENABLE_INTERNAL_SCHEDULER=true
-TIMEZONE=Asia/Kuala_Lumpur
-```
+---
 
-会在每天：
-- 04:00
-- 22:00
+## 20:50
 
-自动跑扫描。
+/run-t-radar
 
-注意：这方式简单，但不如平台原生 cron 稳定；服务重启时，扫描会依赖服务是否已恢复。
+筛选今日重点。
 
-## 6) 盘前数据说明
+---
 
-`yfinance.download(..., prepost=True)` 官方文档说明可以把盘前/盘后数据包含进结果。citeturn669746search3turn669746search7
+## 22:15
 
-所以 V7 的逻辑是：
-- 先扫 200 支日线
-- 再只对高分股补跑新闻与盘前
-- 这样速度不会太慢
+/run-t-live
 
-## 7) Telegram 说明
+等待真正进场。
 
-Telegram Bot API 官方说明 Bot API 是 HTTP-based interface，所以这个包是直接用 `sendMessage` 发通知。citeturn669746search2turn669746search10
+---
 
-## 8) 现在这包包含什么
+## 23:00
 
-主名单会推送：
-- 股票代码
-- 等级 / 分数
-- 5%潜力标签
-- 收盘涨幅
-- 量比
-- 距离突破
-- 吸筹等级
-- 主力资金分
-- 新闻条数
-- 盘前变化
-- 明天买点
-- 不追价区
-- 止损 / 止盈
-- 行动策略
+/run-t-live
 
-提前预警名单会推送：
-- 吸筹 A / B
-- 距离突破
-- 量比
-- 趋势
-- 新闻条数
+观察二波机会。
 
-## 9) 你接下来最可能要改的地方
+---
 
-### 想更保守：
-```bash
-MIN_AVG_DOLLAR_VOLUME=8000000
-VOLUME_RATIO_MIN=2.2
-BREAKOUT_DISTANCE_PCT=4
-```
+## 03:00
 
-### 想更激进：
-```bash
-MIN_AVG_DOLLAR_VOLUME=2000000
-VOLUME_RATIO_MIN=1.5
-BREAKOUT_DISTANCE_PCT=6
-```
+/run-t-radar
 
-## 10) 备注
+筛选次日预备股。
 
-- 盘前数据与新闻有时会因为数据源限制而为空，这时程序会给 0 分，不会直接报错。
-- 这套是“提高命中率”的扫描工具，不是保证第二天一定涨 5%。
+---
+
+# V23.1 核心理念
+
+不是预测市场。
+
+而是：
+
+* 跟随资金
+* 过滤垃圾机会
+* 只做高质量波动
+* 避免财报黑天鹅
+* 等待确认后出手
+
+真正职业做T：
+
+重点不是“买”。
+
+而是：
+
+“什么时候不做”。
