@@ -46,7 +46,7 @@ MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.02"))
 MAX_POSITION_RATIO = float(os.getenv("MAX_POSITION_RATIO", "0.30"))
 MAX_LOSS_AMOUNT = ACCOUNT_SIZE * MAX_RISK_PER_TRADE
 
-DEFAULT_MY_STOCKS = os.getenv("MY_STOCKS", "IONQ,APP,AFRM,PLTR,NVDA,TSLA,AMD,META,AMZN,CRM,SOUN,LUNR,SMCI,SOFI,TEM").strip()
+DEFAULT_MY_STOCKS = os.getenv("MY_STOCKS", "APP,AFRM,IONQ,LUNR,PLTR,NVDA,SOUN,TSLA").strip()
 T_RADAR_STOCKS_ENV = os.getenv("T_RADAR_STOCKS", "").strip()
 T_MIN_DOLLAR_VOLUME = float(os.getenv("T_MIN_DOLLAR_VOLUME", "80000000"))
 T_MIN_AVG_RANGE = float(os.getenv("T_MIN_AVG_RANGE", "3.0"))
@@ -75,6 +75,13 @@ HOT_POOL_MIN_RVOL = float(os.getenv("HOT_POOL_MIN_RVOL", "1.8"))
 HOT_POOL_MIN_RANGE = float(os.getenv("HOT_POOL_MIN_RANGE", "5.0"))
 HOT_POOL_MIN_DOLLAR_VOLUME = float(os.getenv("HOT_POOL_MIN_DOLLAR_VOLUME", "150000000"))
 
+# V23.1 专业做T时间参数 + 防重复发送锁
+# 防止浏览器重复刷新 / Railway重复触发导致 Telegram 刷屏
+HOT_POOL_COOLDOWN_SEC = int(os.getenv("HOT_POOL_COOLDOWN_SEC", "900"))      # 15分钟内不重复发送Hot Pool
+T_RADAR_COOLDOWN_SEC = int(os.getenv("T_RADAR_COOLDOWN_SEC", "600"))        # 10分钟内不重复发送T Radar
+T_LIVE_COOLDOWN_SEC = int(os.getenv("T_LIVE_COOLDOWN_SEC", "300"))          # 5分钟内不重复发送T Live
+SEND_EMPTY_HOT_POOL = os.getenv("SEND_EMPTY_HOT_POOL", "0") == "1"         # 默认不发送“暂无热点”
+
 TZ_KL = pytz.timezone("Asia/Kuala_Lumpur")
 TZ_ET = pytz.timezone("US/Eastern")
 
@@ -91,6 +98,9 @@ LAST_WATCHLIST_SIGNATURE = ""
 LAST_PREBREAKOUT_SIGNATURE = ""
 LAST_MARKET_REGIME = ""
 LAST_T_RADAR_SIGNATURE = ""
+LAST_T_LIVE_SIGNATURE = ""
+LAST_HOT_POOL_SIGNATURE = ""
+LAST_ALERT_TS = {}
 INTRADAY_BREAKOUT_SENT = set()
 MY_STOCKS = []
 
@@ -2006,19 +2016,47 @@ def run_watchlist(force=False):
 
 
 
-def run_hot_pool(force=True):
+def cooldown_check(name, seconds, force=False):
+    """V23.1 防重复发送锁：同一个功能在冷却时间内不会重复推送Telegram。"""
+    if force:
+        return True, 0
+    now_ts = time.time()
+    last_ts = LAST_ALERT_TS.get(name, 0)
+    remain = int(seconds - (now_ts - last_ts))
+    if remain > 0:
+        return False, remain
+    LAST_ALERT_TS[name] = now_ts
+    return True, 0
+
+
+def run_hot_pool(force=False):
+    global LAST_HOT_POOL_SIGNATURE
+    ok, remain = cooldown_check("hot_pool", HOT_POOL_COOLDOWN_SEC, force=force)
+    if not ok:
+        return {"status": "cooldown", "message": f"hot pool cooldown {remain}s"}
+
     results = scan_hot_pool()
     if not results:
-        send_telegram("🔥 V23 今日热点池\n" + now_kl_str() + "\n暂无符合条件热点股")
-        return {"status": "empty", "hot_pool": []}
-    lines = ["🔥 V23 今日自动热点池", now_kl_str(), ""]
-    for i, r in enumerate(results, 1):
+        # V23.1 默认不发送空热点，避免Telegram刷屏
+        if SEND_EMPTY_HOT_POOL:
+            sig = f"empty:{now_et().date()}:{now_kl().strftime('%H:%M')}"
+            if force or sig != LAST_HOT_POOL_SIGNATURE:
+                LAST_HOT_POOL_SIGNATURE = sig
+                send_telegram("🔥 V23.1 今日热点池\n" + now_kl_str() + "\n暂无符合条件热点股")
+        return {"status": "empty", "message": "no hot stocks", "hot_pool": []}
+
+    sig = "|".join([f"{x['symbol']}:{x.get('hot_score','-')}:{x.get('effective_rvol','-')}" for x in results[:HOT_POOL_TOP_N]])
+    if (not force) and sig == LAST_HOT_POOL_SIGNATURE:
+        return {"status": "same", "hot_pool": results}
+    LAST_HOT_POOL_SIGNATURE = sig
+
+    lines = ["🔥 V23.1 今日自动热点池", now_kl_str(), ""]
+    for i, r in enumerate(results[:HOT_POOL_TOP_N], 1):
         lines.append(f"{i}. {r['symbol']}｜热度 {r['hot_score']}｜RVOL {r['effective_rvol']}｜今日振幅 {r['today_range']}%｜成交额 ${r['dollar_volume_m']}M")
     lines.append("")
     lines.append("规则：热点池只做轻仓确认，不熟悉的票第一天只观察，第二天仍有量才提高优先级。")
     send_telegram("\n".join(lines))
     return {"status": "ok", "hot_pool": results}
-
 
 def build_trade_summary_text():
     summary = summarize_trades()
@@ -2043,42 +2081,88 @@ def run_t_radar(force=False):
     global LAST_T_RADAR_SIGNATURE
     if is_weekend_et():
         return {"status": "skip", "watchlist": get_t_radar_symbols()}
+
+    ok, remain = cooldown_check("t_radar", T_RADAR_COOLDOWN_SEC, force=force)
+    if not ok:
+        return {"status": "cooldown", "message": f"t radar cooldown {remain}s"}
+
     results = scan_t_radar()
     if not results:
         return {"status": "empty", "watchlist": get_t_radar_symbols()}
     top = results[:10]
-    sig = "|".join([f"{x['symbol']}:{x['t_score']}:{x['price']}:{x.get('vwap','-')}" for x in top])
+    sig = "|".join([f"{x['symbol']}:{x['t_score']}:{x['price']}:{x.get('vwap','-')}:{x.get('action_signal','-')}" for x in top])
     if (not force) and sig == LAST_T_RADAR_SIGNATURE:
         return {"status": "same", "top": top}
     LAST_T_RADAR_SIGNATURE = sig
     save_state()
-    send_telegram(build_t_radar_text("⚡ V23 专业做T雷达 Top10", top))
+    send_telegram(build_t_radar_text("⚡ V23.1 专业做T雷达 Top10", top))
     return {"status": "ok", "top": top, "watchlist": get_t_radar_symbols()}
+
+
+def run_t_live(force=False):
+    """V23.1 盘中确认：使用同一套做T评分，但独立冷却时间，避免盘中刷屏。"""
+    global LAST_T_LIVE_SIGNATURE
+    if is_weekend_et():
+        return {"status": "skip", "watchlist": get_t_radar_symbols()}
+
+    ok, remain = cooldown_check("t_live", T_LIVE_COOLDOWN_SEC, force=force)
+    if not ok:
+        return {"status": "cooldown", "message": f"t live cooldown {remain}s"}
+
+    results = scan_t_radar()
+    if not results:
+        return {"status": "empty", "watchlist": get_t_radar_symbols()}
+
+    # 盘中只重点推送前10，但签名加入动作信号，避免重复内容
+    top = results[:10]
+    sig = "|".join([f"{x['symbol']}:{x['price']}:{x.get('action_signal','-')}:{x.get('orb_status','-')}:{x.get('dist_vwap','-')}" for x in top])
+    if (not force) and sig == LAST_T_LIVE_SIGNATURE:
+        return {"status": "same", "top": top}
+    LAST_T_LIVE_SIGNATURE = sig
+    send_telegram(build_t_radar_text("⚡ V23.1 T Live 盘中确认 Top10", top))
+    return {"status": "ok", "top": top, "watchlist": get_t_radar_symbols()}
+
 
 # ============================================================
 # Scheduler
 # ============================================================
 
 def scheduler_loop():
+    # V23.1 职业做T时间参数（马来西亚时间 / KL Time）
+    # Hot Pool = 市场炒谁；T Radar = 今天做谁；T Live = 现在能不能做
     weekdays = [schedule.every().monday, schedule.every().tuesday, schedule.every().wednesday, schedule.every().thursday, schedule.every().friday]
     for d in weekdays:
-        d.at("20:35").do(run_hot_pool)
+        # 盘前：先找热点，再筛做T名单
+        d.at("20:20").do(run_hot_pool)
+        d.at("20:50").do(run_t_radar)
+
+        # 开盘后确认：避开开盘前30分钟乱波动
+        d.at("22:15").do(run_t_live)
+        d.at("23:00").do(run_t_live)
+
+        # 午盘/尾盘：找二波和隔夜候选
+        d.at("00:00").do(run_hot_pool)
+        d.at("01:00").do(run_t_live)
+        d.at("03:00").do(run_t_radar)
+        d.at("03:10").do(run_hot_pool)
+
+        # 原本功能保留，但减少噪音
         d.at("20:45").do(run_prebreakout)
         d.at("21:00").do(run_premarket)
         d.at("22:05").do(run_watchlist)
-        d.at("22:10").do(run_t_radar)
-    schedule.every().day.at("04:20").do(run_close)
-    schedule.every().day.at("04:35").do(run_bottom)
-    schedule.every().day.at("04:40").do(run_prebreakout)
-    schedule.every().day.at("04:50").do(run_watchlist)
-    schedule.every().day.at("04:55").do(run_t_radar)
-    schedule.every().day.at("05:05").do(lambda: send_telegram(build_trade_summary_text()))
+        d.at("04:20").do(run_close)
+        d.at("04:35").do(run_bottom)
+        d.at("04:40").do(run_prebreakout)
+        d.at("04:50").do(run_watchlist)
+        d.at("05:05").do(lambda: send_telegram(build_trade_summary_text()))
+
     while True:
         try:
             schedule.run_pending()
         except Exception:
             pass
         time.sleep(15)
+
 
 # ============================================================
 # Flask Routes
@@ -2118,28 +2202,29 @@ def route_watchlist_run():
 
 @app.route("/run-t-radar")
 def route_t_radar_run():
-    force = request.args.get("force", "1") == "1"
+    force = request.args.get("force", "0") == "1"
     return jsonify(run_t_radar(force=force))
 
 @app.route("/run-tradar")
 def route_t_radar_alias():
-    force = request.args.get("force", "1") == "1"
+    force = request.args.get("force", "0") == "1"
     return jsonify(run_t_radar(force=force))
 
 @app.route("/run-t-live")
 def route_t_live_alias():
-    force = request.args.get("force", "1") == "1"
-    return jsonify(run_t_radar(force=force))
+    force = request.args.get("force", "0") == "1"
+    return jsonify(run_t_live(force=force))
 
 
 @app.route("/run-t-strict")
 def route_t_strict_alias():
-    force = request.args.get("force", "1") == "1"
+    force = request.args.get("force", "0") == "1"
     return jsonify(run_t_radar(force=force))
 
 @app.route("/run-hot-pool")
 def route_hot_pool_run():
-    return jsonify(run_hot_pool(force=True))
+    force = request.args.get("force", "0") == "1"
+    return jsonify(run_hot_pool(force=force))
 
 @app.route("/hot-pool")
 def route_hot_pool_info():
@@ -2244,59 +2329,6 @@ def route_position_remove():
     existed = remove_position(symbol)
     return jsonify({"status": "ok", "message": f"{symbol} removed" if existed else f"{symbol} not found", "positions": load_positions()})
 
-@app.route("/b/<symbol>/<price>/<qty>")
-@app.route("/b/<symbol>/<price>/<qty>/<setup>")
-def quick_buy(symbol, price, qty, setup="manual"):
-
-    trade = {
-        "symbol": symbol.upper(),
-        "side": "BUY",
-        "price": float(price),
-        "qty": int(qty),
-        "setup": setup,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-    trades.append(trade)
-
-    msg = (
-        f"🟢 买入记录\n"
-        f"{symbol.upper()} | {qty}股 @ ${price}\n"
-        f"Setup: {setup}"
-    )
-
-    send_telegram(msg)
-
-    return jsonify({
-        "ok": True,
-        "trade": trade
-    })
-
-@app.route("/s/<symbol>/<price>/<qty>")
-def quick_sell(symbol, price, qty):
-
-    trade = {
-        "symbol": symbol.upper(),
-        "side": "SELL",
-        "price": float(price),
-        "qty": int(qty),
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-    trades.append(trade)
-
-    msg = (
-        f"🔴 卖出记录\n"
-        f"{symbol.upper()} | {qty}股 @ ${price}"
-    )
-
-    send_telegram(msg)
-
-    return jsonify({
-        "ok": True,
-        "trade": trade
-    })
- 
 @app.route("/position/clear")
 def route_position_clear():
     save_positions({})
