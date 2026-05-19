@@ -1471,7 +1471,7 @@ def _score_hot_candidate(symbol):
         return None
     
     hot_score = effective_rvol * 20 + today_range * 3 + min(dollar_volume / 100000000, 10)
-        return {"symbol": symbol, "hot_score": round(hot_score, 1), "effective_rvol": round(effective_rvol, 2), "today_range": round(today_range, 2), "avg_range20": round(avg_range20, 2), "dollar_volume_m": round(dollar_volume/1000000, 1)}
+    return {"symbol": symbol, "hot_score": round(hot_score, 1), "effective_rvol": round(effective_rvol, 2), "today_range": round(today_range, 2), "avg_range20": round(avg_range20, 2), "dollar_volume_m": round(dollar_volume/1000000, 1)}
 
 def get_t_radar_symbols():
     """V23：核心观察池 + 自动热点池。总数仍控制在 T_MAX_STOCKS，避免看太多。"""
