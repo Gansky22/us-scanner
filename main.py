@@ -73,10 +73,10 @@ EVENT_RISK_ENABLED = os.getenv("EVENT_RISK_ENABLED", "1") == "1"
 EARNINGS_BLOCK_DAYS = int(os.getenv("EARNINGS_BLOCK_DAYS", "1"))          # 财报前后N天降级
 GAP_RISK_PCT = float(os.getenv("GAP_RISK_PCT", "5.0"))                   # Gap超过这个，不做A级
 HOT_POOL_ENABLED = os.getenv("HOT_POOL_ENABLED", "1") == "1"
-HOT_POOL_TOP_N = int(os.getenv("HOT_POOL_TOP_N", "5"))
-HOT_POOL_MIN_RVOL = float(os.getenv("HOT_POOL_MIN_RVOL", "1.8"))
-HOT_POOL_MIN_RANGE = float(os.getenv("HOT_POOL_MIN_RANGE", "5.0"))
-HOT_POOL_MIN_DOLLAR_VOLUME = float(os.getenv("HOT_POOL_MIN_DOLLAR_VOLUME", "150000000"))
+HOT_POOL_TOP_N = int(os.getenv("HOT_POOL_TOP_N", "10"))
+HOT_POOL_MIN_RVOL = float(os.getenv("HOT_POOL_MIN_RVOL", "1.0"))
+HOT_POOL_MIN_RANGE = float(os.getenv("HOT_POOL_MIN_RANGE", "2.0"))
+HOT_POOL_MIN_DOLLAR_VOLUME = float(os.getenv("HOT_POOL_MIN_DOLLAR_VOLUME", "50000000"))
 
 # V23.2 专业做T时间参数 + 防重复发送锁
 # 防止浏览器重复刷新 / Railway重复触发导致 Telegram 刷屏
@@ -1460,10 +1460,18 @@ def _score_hot_candidate(symbol):
         intraday_rvol = float(vol.iloc[-1]) / avg_vol20 if avg_vol20 > 0 else 0
     avg_range20 = float(((high - low) / close * 100).rolling(20).mean().iloc[-1])
     effective_rvol = intraday_rvol
-    if dollar_volume < HOT_POOL_MIN_DOLLAR_VOLUME or effective_rvol < HOT_POOL_MIN_RVOL or today_range < HOT_POOL_MIN_RANGE:
+    
+    if dollar_volume < HOT_POOL_MIN_DOLLAR_VOLUME:
         return None
+    
+    if effective_rvol < HOT_POOL_MIN_RVOL and today_range < HOT_POOL_MIN_RANGE:
+        return None
+    
+    if last > 0 and today_range > 12:
+        return None
+    
     hot_score = effective_rvol * 20 + today_range * 3 + min(dollar_volume / 100000000, 10)
-    return {"symbol": symbol, "hot_score": round(hot_score, 1), "effective_rvol": round(effective_rvol, 2), "today_range": round(today_range, 2), "avg_range20": round(avg_range20, 2), "dollar_volume_m": round(dollar_volume/1000000, 1)}
+        return {"symbol": symbol, "hot_score": round(hot_score, 1), "effective_rvol": round(effective_rvol, 2), "today_range": round(today_range, 2), "avg_range20": round(avg_range20, 2), "dollar_volume_m": round(dollar_volume/1000000, 1)}
 
 def get_t_radar_symbols():
     """V23：核心观察池 + 自动热点池。总数仍控制在 T_MAX_STOCKS，避免看太多。"""
