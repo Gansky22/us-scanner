@@ -113,6 +113,7 @@ LAST_MARKET_REGIME = ""
 LAST_T_RADAR_SIGNATURE = ""
 LAST_T_LIVE_SIGNATURE = ""
 LAST_HOT_POOL_SIGNATURE = ""
+LAST_TRADE_REPORT_SIGNATURE = ""
 LAST_ALERT_TS = {}
 YF_FAIL_CACHE = {}
 INTRADAY_BREAKOUT_SENT = set()
@@ -2155,6 +2156,33 @@ def build_trade_summary_text():
     lines.append("用途：记录每次买卖原因，长期找出你最赚钱和最容易亏的模式。")
     return "\n".join(lines)
 
+def run_trade_report(force=False):
+    global LAST_TRADE_REPORT_SIGNATURE
+
+    summary = summarize_trades()
+
+    # 没交易不发
+    if summary["total_trades"] <= 0:
+        return {"status": "empty"}
+
+    sig = (
+        f"{summary['total_trades']}:"
+        f"{summary['closed_rounds']}:"
+        f"{summary['realized_pnl']}:"
+        f"{summary['win_rate']}"
+    )
+
+    if (not force) and sig == LAST_TRADE_REPORT_SIGNATURE:
+        return {"status": "same"}
+
+    LAST_TRADE_REPORT_SIGNATURE = sig
+    send_telegram(build_trade_summary_text())
+
+    return {
+        "status": "ok",
+        "summary": summary
+    }
+    
 def run_t_radar(force=False):
     global LAST_T_RADAR_SIGNATURE
     if is_weekend_et():
@@ -2232,7 +2260,7 @@ def scheduler_loop():
         d.at("04:35").do(run_bottom)
         d.at("04:40").do(run_prebreakout)
         d.at("04:50").do(run_watchlist)
-        d.at("05:05").do(lambda: send_telegram(build_trade_summary_text()))
+        d.at("05:05").do(run_trade_report)
 
     while True:
         try:
@@ -2321,6 +2349,53 @@ def route_trade_add():
         return jsonify({"status": "error", "message": "missing/invalid params", "example": "/trade/add?symbol=IONQ&side=BUY&shares=10&price=50&mode=VWAP&reason=vwap_pullback"}), 400
     try:
         trade = add_trade_record(symbol, side, int(float(shares)), float(price), reason=reason, mode=mode, fees=float(fees))
+        return jsonify({"status": "ok", "trade": trade})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+@app.route("/b/<symbol>/<price>/<shares>")
+@app.route("/b/<symbol>/<price>/<shares>/<mode>")
+def route_quick_buy(symbol, price, shares, mode="manual"):
+    try:
+        trade = add_trade_record(
+            symbol=symbol,
+            side="BUY",
+            shares=int(float(shares)),
+            price=float(price),
+            reason=mode,
+            mode=mode,
+            fees=0
+        )
+        send_telegram(
+            f"🟢 买入记录\n"
+            f"{trade['symbol']}｜{trade['shares']}股 @ ${trade['price']}\n"
+            f"模式：{trade['mode']}\n"
+            f"时间：{trade['time_kl']}"
+        )
+        return jsonify({"status": "ok", "trade": trade})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+
+@app.route("/s/<symbol>/<price>/<shares>")
+@app.route("/s/<symbol>/<price>/<shares>/<mode>")
+def route_quick_sell(symbol, price, shares, mode="manual"):
+    try:
+        trade = add_trade_record(
+            symbol=symbol,
+            side="SELL",
+            shares=int(float(shares)),
+            price=float(price),
+            reason=mode,
+            mode=mode,
+            fees=0
+        )
+        send_telegram(
+            f"🔴 卖出记录\n"
+            f"{trade['symbol']}｜{trade['shares']}股 @ ${trade['price']}\n"
+            f"模式：{trade['mode']}\n"
+            f"时间：{trade['time_kl']}"
+        )
         return jsonify({"status": "ok", "trade": trade})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
