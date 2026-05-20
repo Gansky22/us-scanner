@@ -7,6 +7,7 @@ import io
 import contextlib
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from kelly_module import analyze_setup_kelly
 
 import pandas as pd
 import pytz
@@ -2086,6 +2087,19 @@ def run_bottom():
     send_telegram(build_text("📦 V18 底部吸筹 Top10", top))
     return {"status": "ok", "top": top}
 
+@app.route("/kelly")
+def run_kelly():
+    setup = request.args.get("setup")
+    market = request.args.get("market")
+    min_trades = int(request.args.get("min", 20))
+
+    result = analyze_setup_kelly(
+        setup=setup,
+        market_regime=market,
+        min_trades=min_trades
+    )
+
+    return jsonify(result)
 
 def run_watchlist(force=False):
     global LAST_WATCHLIST_SIGNATURE
