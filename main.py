@@ -2093,7 +2093,10 @@ def run_kelly():
     market = request.args.get("market")
     min_trades = int(request.args.get("min", 20))
 
+    trades = load_trade_journal()
+
     result = analyze_setup_kelly(
+        trades=trades,
         setup=setup,
         market_regime=market,
         min_trades=min_trades
