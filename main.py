@@ -38,6 +38,7 @@ app = Flask(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "1") == "1"
 PORT = int(os.getenv("PORT", "5000"))
 
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
@@ -87,6 +88,10 @@ HOT_POOL_MIN_DOLLAR_VOLUME = float(os.getenv("HOT_POOL_MIN_DOLLAR_VOLUME", "3000
 HOT_POOL_COOLDOWN_SEC = int(os.getenv("HOT_POOL_COOLDOWN_SEC", "900"))      # 15分钟内不重复发送Hot Pool
 T_RADAR_COOLDOWN_SEC = int(os.getenv("T_RADAR_COOLDOWN_SEC", "600"))        # 10分钟内不重复发送T Radar
 T_LIVE_COOLDOWN_SEC = int(os.getenv("T_LIVE_COOLDOWN_SEC", "300"))          # 5分钟内不重复发送T Live
+REGIME_COOLDOWN_SEC = int(os.getenv("REGIME_COOLDOWN_SEC", "1800"))            # 30分钟内不重复发送大盘模式
+SECTOR_HEAT_COOLDOWN_SEC = int(os.getenv("SECTOR_HEAT_COOLDOWN_SEC", "1800"))  # 30分钟内不重复发送板块热度
+T_ETF_COOLDOWN_SEC = int(os.getenv("T_ETF_COOLDOWN_SEC", "900"))               # 15分钟内不重复发送ETF T雷达
+DAILY_REVIEW_COOLDOWN_SEC = int(os.getenv("DAILY_REVIEW_COOLDOWN_SEC", "21600")) # 6小时内不重复发送每日复盘
 SEND_EMPTY_HOT_POOL = os.getenv("SEND_EMPTY_HOT_POOL", "0") == "1"         # 默认不发送“暂无热点”
 
 # V23.2 稳定优化参数
@@ -393,6 +398,8 @@ def save_state():
 # ============================================================
 
 def send_telegram(msg):
+    if not TELEGRAM_ENABLED:
+        return False
     if not BOT_TOKEN or not CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -2047,7 +2054,10 @@ def build_regime_text(detail):
 
 
 def run_regime(force=False):
+    ok, remain = cooldown_check("regime", REGIME_COOLDOWN_SEC, force=force)
     detail = market_regime_detail()
+    if not ok:
+        return {"status": "cooldown", "message": f"regime cooldown {remain}s", "regime": detail}
     text = build_regime_text(detail)
     send_telegram(text)
     return {"status": "ok", "regime": detail}
@@ -2104,6 +2114,9 @@ def build_sector_heat_text(rows):
 
 
 def run_sector_heat(force=False):
+    ok, remain = cooldown_check("sector_heat", SECTOR_HEAT_COOLDOWN_SEC, force=force)
+    if not ok:
+        return {"status": "cooldown", "message": f"sector heat cooldown {remain}s"}
     rows = sector_heatmap()
     send_telegram(build_sector_heat_text(rows))
     return {"status": "ok", "sectors": rows[:12]}
@@ -2111,6 +2124,9 @@ def run_sector_heat(force=False):
 
 def run_t_etf(force=False):
     """V24: TQQQ/SQQQ/SOXL/SOXS 双向ETF提醒。只给方向，不自动下单。"""
+    ok, remain = cooldown_check("t_etf", T_ETF_COOLDOWN_SEC, force=force)
+    if not ok:
+        return {"status": "cooldown", "message": f"t etf cooldown {remain}s"}
     regime = market_regime_detail()
     mode = regime.get("mode", "NEUTRAL")
     results = []
@@ -2544,9 +2560,9 @@ def scheduler_loop():
         # 盘前：先找热点，再筛做T名单
         d.at("20:15").do(run_regime)
         d.at("20:20").do(run_hot_pool)
-        d.at("20:35").do(run_sector_heat)
+        # d.at("20:35").do(run_sector_heat)  # 手动运行，避免Telegram刷屏
         d.at("20:50").do(run_t_radar)
-        d.at("21:10").do(run_t_etf)
+        # d.at("21:10").do(run_t_etf)  # 手动运行，避免Telegram刷屏
 
         # 开盘后确认：避开开盘前30分钟乱波动
         d.at("22:15").do(run_t_live)
@@ -2851,7 +2867,11 @@ def route_system_status():
         "cooldown": {
             "hot_pool_sec": HOT_POOL_COOLDOWN_SEC,
             "t_radar_sec": T_RADAR_COOLDOWN_SEC,
-            "t_live_sec": T_LIVE_COOLDOWN_SEC
+            "t_live_sec": T_LIVE_COOLDOWN_SEC,
+            "regime_sec": REGIME_COOLDOWN_SEC,
+            "sector_heat_sec": SECTOR_HEAT_COOLDOWN_SEC,
+            "t_etf_sec": T_ETF_COOLDOWN_SEC,
+            "daily_review_sec": DAILY_REVIEW_COOLDOWN_SEC
         },
         "runtime_bad_symbols": len(YF_FAIL_CACHE),
         "watchlist": get_t_radar_symbols()
