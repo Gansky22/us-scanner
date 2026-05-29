@@ -19,7 +19,7 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 # ============================================================
-# 美股爆发扫描器 V24 全面提升版 + Hot Pool修复 + 双向ETF T + 板块热度 + 复盘
+# 美股爆发扫描器 V24.1 完整版 + Hot Pool修复 + Momentum Leader + 双向ETF T + 板块热度 + 复盘
 # 基于 V17：自选股 + 持仓追踪 + 买卖监控 + 防追高 + 提前爆发扫描
 # V18 新增：
 # 1) 主力慢吸筹评分 accumulation_score
@@ -92,6 +92,13 @@ REGIME_COOLDOWN_SEC = int(os.getenv("REGIME_COOLDOWN_SEC", "1800"))            #
 SECTOR_HEAT_COOLDOWN_SEC = int(os.getenv("SECTOR_HEAT_COOLDOWN_SEC", "1800"))  # 30分钟内不重复发送板块热度
 T_ETF_COOLDOWN_SEC = int(os.getenv("T_ETF_COOLDOWN_SEC", "900"))               # 15分钟内不重复发送ETF T雷达
 DAILY_REVIEW_COOLDOWN_SEC = int(os.getenv("DAILY_REVIEW_COOLDOWN_SEC", "21600")) # 6小时内不重复发送每日复盘
+MOMENTUM_COOLDOWN_SEC = int(os.getenv("MOMENTUM_COOLDOWN_SEC", "900"))                  # 15分钟内不重复发送Momentum Leader
+
+# V24.1 Momentum Leader 参数：解决APP/LUNR/ONDS这类强趋势股被防追高过滤的问题
+MOMENTUM_TOP_N = int(os.getenv("MOMENTUM_TOP_N", "10"))
+MOMENTUM_MIN_CHANGE = float(os.getenv("MOMENTUM_MIN_CHANGE", "4.0"))                    # 日涨幅至少4%
+MOMENTUM_MIN_RVOL = float(os.getenv("MOMENTUM_MIN_RVOL", "0.8"))                        # 自选股宽松，避免yfinance盘后RVOL偏低
+MOMENTUM_MIN_DOLLAR_VOLUME = float(os.getenv("MOMENTUM_MIN_DOLLAR_VOLUME", "10000000")) # 自选股最低1000万成交额
 SEND_EMPTY_HOT_POOL = os.getenv("SEND_EMPTY_HOT_POOL", "0") == "1"         # 默认不发送“暂无热点”
 
 # V23.2 稳定优化参数
@@ -123,6 +130,7 @@ LAST_T_RADAR_SIGNATURE = ""
 LAST_T_LIVE_SIGNATURE = ""
 LAST_HOT_POOL_SIGNATURE = ""
 LAST_TRADE_REPORT_SIGNATURE = ""
+LAST_MOMENTUM_SIGNATURE = ""
 LAST_ALERT_TS = {}
 YF_FAIL_CACHE = {}
 INTRADAY_BREAKOUT_SENT = set()
@@ -594,10 +602,7 @@ def capital_grade(score):
 
 
 def prebreakout_level(score, rsi=50, vol_ratio=1, dist_ma20=0, fake_score=0, green_days=0):
-    """
-    V19.1 主力确认等级
-    重点：不是分数高就一定A级，必须通过量能/风险确认
-    """
+    """ V19.1 主力确认等级 重点：不是分数高就一定A级，必须通过量能/风险确认 """
 
     # 强制降级规则
     forced_cap = None
@@ -1537,11 +1542,24 @@ def _score_hot_candidate(symbol):
     if effective_rvol < HOT_POOL_MIN_RVOL and today_range < HOT_POOL_MIN_RANGE:
         return None
     
-    if last > 0 and today_range > 12:
-        return None
-    
-    hot_score = effective_rvol * 20 + today_range * 3 + min(dollar_volume / 100000000, 10)
-    return {"symbol": symbol, "hot_score": round(hot_score, 1), "effective_rvol": round(effective_rvol, 2), "today_range": round(today_range, 2), "avg_range20": round(avg_range20, 2), "dollar_volume_m": round(dollar_volume/1000000, 1)}
+    # V24.1: 不再因为 today_range > 12 直接过滤。
+    # APP/LUNR/ONDS 这类Momentum Leader经常日内大波动，直接过滤会导致Hot Pool empty。
+    # 这里改成扣分 + 风险标记，让它出现但提醒不要追高。
+    overheat = today_range > 12
+    overheat_penalty = 8 if overheat else 0
+
+    change1 = pct(last, float(close.iloc[-2])) if len(close) >= 2 else 0
+    hot_score = effective_rvol * 20 + today_range * 3 + min(dollar_volume / 100000000, 10) + max(0, change1) * 1.5 - overheat_penalty
+    return {
+        "symbol": symbol,
+        "hot_score": round(hot_score, 1),
+        "effective_rvol": round(effective_rvol, 2),
+        "today_range": round(today_range, 2),
+        "avg_range20": round(avg_range20, 2),
+        "dollar_volume_m": round(dollar_volume / 1000000, 1),
+        "change1": round(change1, 2),
+        "overheat": overheat,
+    }
 
 def get_t_radar_symbols():
     """V23：核心观察池 + 自动热点池。总数仍控制在 T_MAX_STOCKS，避免看太多。"""
@@ -2191,9 +2209,213 @@ def build_daily_review_text():
 
 
 def run_daily_review(force=False):
+    ok, remain = cooldown_check("daily_review", DAILY_REVIEW_COOLDOWN_SEC, force=force)
+    if not ok:
+        return {"status": "cooldown", "message": f"daily review cooldown {remain}s", "summary": summarize_trades(), "regime": market_regime_detail()}
     text = build_daily_review_text()
     send_telegram(text)
     return {"status": "ok", "summary": summarize_trades(), "regime": market_regime_detail()}
+
+
+# ============================================================
+# V24.1 Momentum Leader：强趋势股模式（APP/LUNR/ONDS 这类）
+# 目的：强股不再因为“涨太多/离均线远”而完全消失；改为出现 + 风险提醒。
+# ============================================================
+
+def score_momentum_leader(symbol):
+    symbol = clean_symbol(symbol)
+    if not symbol or symbol in BAD_SYMBOLS or should_skip_symbol(symbol):
+        return None
+
+    daily = safe_download(symbol, "6mo", "1d")
+    if daily is None or len(daily) < 60:
+        return None
+
+    close = daily["Close"]
+    high = daily["High"]
+    low = daily["Low"]
+    vol = daily["Volume"]
+
+    last = float(close.iloc[-1])
+    prev = float(close.iloc[-2])
+    if last < 3:
+        return None
+
+    ma5 = float(close.rolling(5).mean().iloc[-1])
+    ma10 = float(close.rolling(10).mean().iloc[-1])
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    ma50 = float(close.rolling(50).mean().iloc[-1])
+    avg_vol20 = float(vol.rolling(20).mean().iloc[-1])
+    vol_ratio = float(vol.iloc[-1] / avg_vol20) if avg_vol20 > 0 else 0
+    dollar_volume = last * avg_vol20
+    change1 = pct(last, prev)
+    change5 = pct(last, float(close.iloc[-6])) if len(close) >= 6 else 0
+    today_range = pct(float(high.iloc[-1]), float(low.iloc[-1]))
+    rsi = float(calc_rsi(close).iloc[-1])
+    dist_ma5 = pct(last, ma5) if ma5 > 0 else 0
+    dist_ma10 = pct(last, ma10) if ma10 > 0 else 0
+    dist_ma20 = pct(last, ma20) if ma20 > 0 else 0
+    high20_prev = float(high.iloc[-21:-1].max()) if len(high) >= 22 else float(high.iloc[:-1].max())
+    breakout_20d = last >= high20_prev * 0.995 if high20_prev > 0 else False
+    strong_trend = last > ma20 and ma5 >= ma10 and ma10 >= ma20 * 0.98
+    my_stock = symbol in MY_STOCKS
+
+    # 自选股放宽：因为你主要看这些股，且yfinance盘后量能有时偏低。
+    min_rvol = MOMENTUM_MIN_RVOL if my_stock else max(1.2, MOMENTUM_MIN_RVOL)
+    min_dollar = MOMENTUM_MIN_DOLLAR_VOLUME if my_stock else max(30_000_000, MOMENTUM_MIN_DOLLAR_VOLUME)
+
+    if dollar_volume < min_dollar:
+        return None
+
+    # 两种进入Momentum Leader的方式：
+    # 1) 日涨幅强 + 趋势站稳
+    # 2) 突破20日高 + 有量 + 趋势站稳
+    if not ((change1 >= MOMENTUM_MIN_CHANGE and strong_trend) or (breakout_20d and vol_ratio >= min_rvol and last > ma20)):
+        return None
+
+    score = 0
+    reasons = []
+    warnings = []
+
+    if change1 >= 10:
+        score += 30; reasons.append("日涨幅>10%，强Momentum")
+    elif change1 >= 6:
+        score += 24; reasons.append("日涨幅>6%，动能强")
+    elif change1 >= MOMENTUM_MIN_CHANGE:
+        score += 18; reasons.append("日涨幅达标")
+
+    if vol_ratio >= 2:
+        score += 20; reasons.append("量能>2x")
+    elif vol_ratio >= 1.3:
+        score += 14; reasons.append("量能放大")
+    elif vol_ratio >= min_rvol:
+        score += 8; reasons.append("量能基本达标")
+    else:
+        score -= 5; warnings.append("量能未明显放大，按观察")
+
+    if breakout_20d:
+        score += 18; reasons.append("突破/接近20日高")
+    if last > ma20 and ma5 >= ma10:
+        score += 16; reasons.append("短线趋势向上")
+    if ma10 >= ma20:
+        score += 8; reasons.append("MA10>=MA20")
+    if dollar_volume >= 100_000_000:
+        score += 8; reasons.append("成交额强")
+    elif dollar_volume >= 30_000_000:
+        score += 4; reasons.append("成交额足够")
+
+    if rsi >= 82:
+        score -= 14; warnings.append("RSI严重过热，不追高")
+    elif rsi >= 75:
+        score -= 8; warnings.append("RSI偏热，等回踩")
+
+    if dist_ma10 >= 12:
+        score -= 10; warnings.append("离MA10过远，只适合等回踩")
+    elif dist_ma10 >= 8:
+        score -= 5; warnings.append("离MA10偏远")
+
+    if today_range >= 12:
+        warnings.append("日内波动>12%，仓位要轻")
+
+    if my_stock:
+        score += 5; reasons.append("MY_STOCKS优先观察")
+
+    score = max(0, min(100, round(score, 1)))
+
+    if score >= 78:
+        level = "A Momentum Leader"
+        action = "🔥 强趋势Leader：不追最高，等VWAP/MA5回踩再做T"
+    elif score >= 62:
+        level = "B Watch Momentum"
+        action = "👀 强势观察：等回踩确认"
+    else:
+        level = "C Watch Only"
+        action = "⚠️ 只观察，不追"
+
+    return {
+        "symbol": symbol,
+        "sector": find_sector(symbol),
+        "price": round(last, 2),
+        "momentum_score": score,
+        "level": level,
+        "action": action,
+        "change1": round(change1, 2),
+        "change5": round(change5, 2),
+        "vol_ratio": round(vol_ratio, 2),
+        "today_range": round(today_range, 2),
+        "rsi": round(rsi, 1),
+        "dist_ma5": round(dist_ma5, 2),
+        "dist_ma10": round(dist_ma10, 2),
+        "dist_ma20": round(dist_ma20, 2),
+        "dollar_volume_m": round(dollar_volume / 1_000_000, 1),
+        "breakout_20d": breakout_20d,
+        "reasons": reasons[:6],
+        "warnings": warnings[:6],
+    }
+
+
+def scan_momentum_leaders():
+    load_watchlist()
+    symbols = list(dict.fromkeys(MY_STOCKS + ALL_SYMBOLS))
+    symbols = [s for s in symbols if s not in BAD_SYMBOLS and not should_skip_symbol(s)]
+    results = []
+    # Momentum主要看MY_STOCKS + 行业池前段，避免Railway过慢
+    if HOT_POOL_SCAN_LIMIT > 0:
+        priority = [s for s in MY_STOCKS if s in symbols]
+        rest = [s for s in symbols if s not in priority]
+        symbols = list(dict.fromkeys(priority + rest[:max(0, HOT_POOL_SCAN_LIMIT - len(priority))]))
+
+    for batch in chunk_list(symbols, BATCH_SIZE):
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = {ex.submit(score_momentum_leader, sym): sym for sym in batch}
+            for f in as_completed(futs):
+                try:
+                    r = f.result()
+                    if r:
+                        results.append(r)
+                except Exception:
+                    pass
+        time.sleep(BATCH_SLEEP)
+
+    results.sort(key=lambda x: (x["momentum_score"], x["change1"], x["vol_ratio"]), reverse=True)
+    return results[:MOMENTUM_TOP_N]
+
+
+def build_momentum_text(arr):
+    lines = ["🔥 V24.1 Momentum Leaders 强趋势股", now_kl_str(), ""]
+    if not arr:
+        lines.append("暂无强趋势Leader。")
+        return "\n".join(lines)
+    for i, r in enumerate(arr, 1):
+        lines.append(f"{i}. {r['symbol']}｜{r['momentum_score']}分｜{r['level']}")
+        lines.append(f"价 {r['price']}｜日涨 {r['change1']}%｜5日 {r['change5']}%｜RVOL {r['vol_ratio']}｜成交额 ${r['dollar_volume_m']}M")
+        lines.append(f"RSI {r['rsi']}｜离MA10 {r['dist_ma10']}%｜振幅 {r['today_range']}%")
+        lines.append(f"动作：{r['action']}")
+        if r.get("reasons"):
+            lines.append("逻辑：" + " / ".join(r["reasons"]))
+        if r.get("warnings"):
+            lines.append("提醒：" + " / ".join(r["warnings"]))
+        lines.append("")
+    lines.append("规则：Momentum Leader 是强趋势观察名单，不等于现价追高；优先等VWAP/MA5/MA10回踩确认。")
+    return "\n".join(lines)
+
+
+def run_momentum_leaders(force=False):
+    global LAST_MOMENTUM_SIGNATURE
+    if is_weekend_et():
+        return {"status": "skip"}
+    ok, remain = cooldown_check("momentum", MOMENTUM_COOLDOWN_SEC, force=force)
+    if not ok:
+        return {"status": "cooldown", "message": f"momentum cooldown {remain}s"}
+    results = scan_momentum_leaders()
+    if not results:
+        return {"status": "empty", "momentum": []}
+    sig = "|".join([f"{x['symbol']}:{x['momentum_score']}:{x['price']}:{x['change1']}" for x in results])
+    if (not force) and sig == LAST_MOMENTUM_SIGNATURE:
+        return {"status": "same", "momentum": results}
+    LAST_MOMENTUM_SIGNATURE = sig
+    send_telegram(build_momentum_text(results))
+    return {"status": "ok", "momentum": results}
 
 # ============================================================
 # Telegram 文案
@@ -2450,7 +2672,10 @@ def run_hot_pool(force=False):
 
     lines = ["🔥 V24 今日自动热点池", now_kl_str(), ""]
     for i, r in enumerate(results[:HOT_POOL_TOP_N], 1):
-        lines.append(f"{i}. {r['symbol']}｜热度 {r['hot_score']}｜RVOL {r['effective_rvol']}｜今日振幅 {r['today_range']}%｜成交额 ${r['dollar_volume_m']}M")
+        risk = "｜⚠️波动大" if r.get("overheat") else ""
+        fb = "｜fallback" if r.get("fallback") else ""
+        chg = f"｜日涨 {r.get('change1')}%" if r.get("change1") is not None else ""
+        lines.append(f"{i}. {r['symbol']}｜热度 {r['hot_score']}｜RVOL {r['effective_rvol']}｜今日振幅 {r['today_range']}%{chg}｜成交额 ${r['dollar_volume_m']}M{risk}{fb}")
     lines.append("")
     lines.append("规则：热点池只做观察和轻仓确认；fallback标记代表宽松观察股，不等于买入。")
     send_telegram("\n".join(lines))
@@ -2513,6 +2738,11 @@ def run_t_radar(force=False):
 
     results = scan_t_radar()
     if not results:
+        # V24.1: T Radar没有安全T买点时，改用Momentum Leader作为观察名单，避免市场大涨却只显示empty。
+        momentum = scan_momentum_leaders()
+        if momentum:
+            send_telegram(build_momentum_text(momentum))
+            return {"status": "watch_only", "message": "no safe T entry, momentum leaders only", "momentum": momentum, "watchlist": get_t_radar_symbols()}
         return {"status": "empty", "watchlist": get_t_radar_symbols()}
     top = results[:10]
     sig = "|".join([f"{x['symbol']}:{x['t_score']}:{x['price']}:{x.get('vwap','-')}:{x.get('action_signal','-')}" for x in top])
@@ -2560,9 +2790,10 @@ def scheduler_loop():
         # 盘前：先找热点，再筛做T名单
         d.at("20:15").do(run_regime)
         d.at("20:20").do(run_hot_pool)
-        # d.at("20:35").do(run_sector_heat)  # 手动运行，避免Telegram刷屏
+        d.at("20:35").do(run_momentum_leaders)
+        # d.at("20:40").do(run_sector_heat) # 手动运行，避免Telegram刷屏
         d.at("20:50").do(run_t_radar)
-        # d.at("21:10").do(run_t_etf)  # 手动运行，避免Telegram刷屏
+        # d.at("21:10").do(run_t_etf) # 手动运行，避免Telegram刷屏
 
         # 开盘后确认：避开开盘前30分钟乱波动
         d.at("22:15").do(run_t_live)
@@ -2570,9 +2801,11 @@ def scheduler_loop():
 
         # 午盘/尾盘：找二波和隔夜候选
         d.at("00:00").do(run_hot_pool)
+        d.at("00:10").do(run_momentum_leaders)
         d.at("01:00").do(run_t_live)
         d.at("03:00").do(run_t_radar)
         d.at("03:10").do(run_hot_pool)
+        d.at("03:20").do(run_momentum_leaders)
 
         # 原本功能保留，但减少噪音
         d.at("20:45").do(run_prebreakout)
@@ -2678,6 +2911,16 @@ def route_t_etf_run():
 def route_daily_review_run():
     force = request.args.get("force", "1") == "1"
     return jsonify(run_daily_review(force=force))
+
+@app.route("/run-momentum")
+def route_momentum_run():
+    force = request.args.get("force", "1") == "1"
+    return jsonify(run_momentum_leaders(force=force))
+
+@app.route("/run-momentum-leaders")
+def route_momentum_leaders_alias():
+    force = request.args.get("force", "1") == "1"
+    return jsonify(run_momentum_leaders(force=force))
 
 @app.route("/trade/add")
 def route_trade_add():
